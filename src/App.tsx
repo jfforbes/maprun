@@ -451,7 +451,7 @@ export default function App() {
                   >
                     <strong>
                       Option {index + 1}
-                      {index === 0 ? ' · Best' : ''}
+                      {opt.optionLabel ? ` · ${opt.optionLabel}` : ''}
                     </strong>
                     <span>
                       {opt.distanceMiles.toFixed(2)} mi ·{' '}

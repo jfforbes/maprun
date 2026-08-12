@@ -54,6 +54,8 @@ export type RouteResult = {
   crossings: number
   turns: number
   label: string
+  /** Why this auto-route option was offered (e.g. lowest climb). */
+  optionLabel?: string
   /** Mid-route handles the user can drag (excludes fixed start/end). */
   controlPoints: LatLng[]
   /** Explicit click waypoints while drawing manually (includes start). */
@@ -467,31 +469,87 @@ function pickDiverseCandidates(
   count: number,
   minDistanceMiles: number,
 ): RouteCandidate[] {
-  const sorted = [...ranked].sort((a, b) => b.score - a.score)
-  const picked: { candidate: RouteCandidate; edges: Set<string> }[] = []
+  const eligible = ranked
+    .map((r) => r.candidate)
+    .filter((c) => displayMiles(c.lengthM) >= minDistanceMiles)
 
-  const tryPick = (maxOverlap: number, requireDistance: boolean) => {
-    for (const entry of sorted) {
-      if (picked.length >= count) return
-      if (
-        requireDistance &&
-        displayMiles(entry.candidate.lengthM) < minDistanceMiles
-      ) {
-        continue
-      }
-      const edges = collectEdgeKeys(entry.candidate.path)
-      if (picked.some((p) => edgeOverlapRatio(p.edges, edges) > maxOverlap)) {
-        continue
-      }
-      picked.push({ candidate: entry.candidate, edges })
+  if (eligible.length === 0) {
+    const soft = ranked
+      .slice()
+      .sort((a, b) => b.score - a.score)
+      .map((r) => r.candidate)
+    return soft.slice(0, count)
+  }
+
+  const tooSimilar = (a: RouteCandidate, b: RouteCandidate) =>
+    edgeOverlapRatio(collectEdgeKeys(a.path), collectEdgeKeys(b.path)) > 0.5
+
+  const alreadyPicked = (c: RouteCandidate, picked: RouteCandidate[]) =>
+    picked.some((p) => tooSimilar(p, c))
+
+  const picked: RouteCandidate[] = []
+
+  // 1) Flattest — climb first, even if it has lights
+  const byClimb = [...eligible].sort(
+    (a, b) =>
+      a.elevGainM - b.elevGainM ||
+      a.signals - b.signals ||
+      a.turns - b.turns ||
+      a.crossings - b.crossings,
+  )
+  if (byClimb[0]) picked.push(byClimb[0])
+
+  // 2) Quietest — fewer lights is fine even with more climb
+  if (picked.length < count) {
+    const byLights = [...eligible].sort(
+      (a, b) =>
+        a.signals - b.signals ||
+        a.elevGainM - b.elevGainM ||
+        a.turns - b.turns ||
+        a.crossings - b.crossings,
+    )
+    const quiet = byLights.find((c) => !alreadyPicked(c, picked))
+    if (quiet) picked.push(quiet)
+  }
+
+  // 3) Fewest sharp turns — another tradeoff axis
+  if (picked.length < count) {
+    const byTurns = [...eligible].sort(
+      (a, b) =>
+        a.turns - b.turns ||
+        a.elevGainM - b.elevGainM ||
+        a.signals - b.signals ||
+        a.crossings - b.crossings,
+    )
+    const smooth = byTurns.find((c) => !alreadyPicked(c, picked))
+    if (smooth) picked.push(smooth)
+  }
+
+  // Fill remaining with next-best score / geographic diversity
+  if (picked.length < count) {
+    const byScore = [...ranked]
+      .sort((a, b) => b.score - a.score)
+      .map((r) => r.candidate)
+      .filter((c) => displayMiles(c.lengthM) >= minDistanceMiles)
+    for (const c of byScore) {
+      if (picked.length >= count) break
+      if (alreadyPicked(c, picked)) continue
+      picked.push(c)
     }
   }
 
-  tryPick(0.45, true)
-  if (picked.length < count) tryPick(0.65, true)
-  if (picked.length < count) tryPick(0.8, false)
+  return picked.slice(0, count)
+}
 
-  return picked.map((p) => p.candidate)
+function optionBlurb(picked: RouteCandidate[], index: number): string {
+  if (index === 0) return 'Lowest climb'
+  const c = picked[index]
+  const flattest = picked[0]
+  if (!flattest) return `Option ${index + 1}`
+  if (c.signals < flattest.signals) return 'Fewer lights'
+  if (c.turns < flattest.turns) return 'Fewer turns'
+  if (c.elevGainM + 1 < flattest.elevGainM) return 'Lower climb'
+  return 'Alternate'
 }
 
 async function buildRouteResult(
@@ -617,8 +675,22 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
   for (let b = 0; b < 360; b += 30) bearings.push(b)
 
   const weightSets: PathCostWeights[] = [
+    // Climb-first: willing to take a light to stay flatter
+    {
+      elevGainPenalty: 200,
+      signalPenalty: 60,
+      turnPenalty: 25,
+      crossingPenalty: 4,
+    },
+    // Balanced quiet + climb
     DEFAULT_WEIGHTS,
-    { ...DEFAULT_WEIGHTS, elevGainPenalty: 180, signalPenalty: 400, turnPenalty: 50 },
+    // Quiet-first alternate for a different option shape
+    {
+      elevGainPenalty: 70,
+      signalPenalty: 900,
+      turnPenalty: 45,
+      crossingPenalty: 10,
+    },
   ]
 
   const ranked: RankedCandidate[] = []
@@ -703,8 +775,7 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
       search.best &&
       search.best.kind === 'loop' &&
       displayMiles(search.best.lengthM) >= req.distanceMiles &&
-      search.best.lengthM <= maxM &&
-      search.best.signals <= 1
+      search.best.lengthM <= maxM
     ) {
       break
     }
@@ -716,8 +787,7 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
     !search.best ||
     search.best.kind !== 'loop' ||
     displayMiles(search.best.lengthM) < req.distanceMiles ||
-    search.best.lengthM > maxM ||
-    search.best.signals > 2
+    search.best.lengthM > maxM
   ) {
     status('Trying out-and-back as backup…')
     for (const weights of weightSets) {
@@ -735,8 +805,7 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
         hasEnoughOptions() &&
         search.best &&
         displayMiles(search.best.lengthM) >= req.distanceMiles &&
-        search.best.lengthM <= maxM &&
-        search.best.signals <= 1
+        search.best.lengthM <= maxM
       ) {
         break
       }
@@ -746,10 +815,10 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
   if (!search.best || displayMiles(search.best.lengthM) < req.distanceMiles) {
     status('Stretching the route to meet distance…')
     const softWeights: PathCostWeights = {
-      turnPenalty: 40,
-      signalPenalty: 500,
-      crossingPenalty: 8,
-      elevGainPenalty: 18,
+      turnPenalty: 25,
+      signalPenalty: 80,
+      crossingPenalty: 5,
+      elevGainPenalty: 160,
     }
     for (let bearing = 0; bearing < 360; bearing += 20) {
       for (const factor of [0.48, 0.55, 0.62]) {
@@ -801,12 +870,16 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
   )
 
   const options: PlannedOption[] = []
-  for (const candidate of selected) {
+  for (let i = 0; i < selected.length; i++) {
+    const candidate = selected[i]
     try {
       const built = await buildRouteResult(graph, candidate, req.distanceMiles)
       options.push({
         candidate,
-        result: built.result,
+        result: {
+          ...built.result,
+          optionLabel: optionBlurb(selected, i),
+        },
         controlIndexes: built.controlIndexes,
       })
     } catch {
@@ -820,15 +893,12 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
     )
   }
 
-  // Re-rank by final measured climb, then lights, turns, crossings
-  options.sort((a, b) => {
-    const climb = a.result.elevationGainFeet - b.result.elevationGainFeet
-    if (Math.abs(climb) > 1) return climb
-    const lights = a.result.signals - b.result.signals
-    if (lights !== 0) return lights
-    const turns = a.result.turns - b.result.turns
-    if (turns !== 0) return turns
-    return a.result.crossings - b.result.crossings
+  const finalized = options.map((o) => o.candidate)
+  options.forEach((opt, i) => {
+    opt.result = {
+      ...opt.result,
+      optionLabel: optionBlurb(finalized, i),
+    }
   })
 
   plannedBundle = { graph, start: req.start, options }

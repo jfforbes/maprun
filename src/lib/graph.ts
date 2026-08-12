@@ -121,10 +121,10 @@ export type PathCostWeights = {
 }
 
 export const DEFAULT_WEIGHTS: PathCostWeights = {
-  // Path cost priority: climb >> lights >> turns >> crossings
-  elevGainPenalty: 120,
-  signalPenalty: 250,
-  turnPenalty: 35,
+  // Prefer flatter paths; lights are secondary (options can trade them off)
+  elevGainPenalty: 140,
+  signalPenalty: 120,
+  turnPenalty: 30,
   crossingPenalty: 5,
 }
 
