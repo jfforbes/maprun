@@ -214,7 +214,7 @@ export default function App() {
       return
     }
     if (!Number.isFinite(maxElevationFeet) || maxElevationFeet < 0) {
-      setError('Max elevation change must be 0 or greater.')
+      setError('Max climb must be 0 or greater.')
       return
     }
     if (distanceMiles > 20) {
@@ -231,7 +231,7 @@ export default function App() {
         start: origin,
         distanceMiles,
         varianceMiles,
-        maxElevationChangeFeet: maxElevationFeet,
+        maxClimbFeet: maxElevationFeet,
         onStatus: setStatus,
       })
 
@@ -310,7 +310,7 @@ export default function App() {
           </div>
 
           <label className="field">
-            <span>Max elevation change (ft)</span>
+            <span>Max climb (ft)</span>
             <input
               type="number"
               min="0"
@@ -322,8 +322,9 @@ export default function App() {
               }
             />
             <em className="field-hint">
-              Caps total up + down for auto routes. Or draw your own after
-              picking a start — same stats either way.
+              Cumulative elevation gain only (descents ignored). Auto routes
+              try to stay under this; draw your own after picking a start if
+              you want full control.
             </em>
           </label>
 

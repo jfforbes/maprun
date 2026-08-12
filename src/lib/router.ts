@@ -37,7 +37,8 @@ export type RouteRequest = {
   start: LatLng
   distanceMiles: number
   varianceMiles: number
-  maxElevationChangeFeet: number
+  /** Max cumulative climb (elevation gain only), in feet */
+  maxClimbFeet: number
   onStatus?: (message: string) => void
 }
 
@@ -154,12 +155,11 @@ function scoreRoute(
   },
   minM: number,
   maxM: number,
-  maxElevChangeM: number,
+  maxClimbM: number,
 ): number {
   const under = Math.max(0, minM - stats.lengthM)
   const over = Math.max(0, stats.lengthM - maxM)
-  const elevChange = stats.elevGainM + stats.elevLossM
-  const elevOver = Math.max(0, elevChange - maxElevChangeM)
+  const climbOver = Math.max(0, stats.elevGainM - maxClimbM)
 
   const inRange = under < 1 && over < 1
   const lengthTarget = minM + Math.min(maxM - minM, minM * 0.08) * 0.5
@@ -174,7 +174,7 @@ function scoreRoute(
     loopBonus -
     under * 2.5 -
     over / 18 -
-    elevOver * 5 -
+    climbOver * 8 -
     // Each light is a major penalty vs small length differences
     stats.signals * 280 -
     stats.crossings * 5 -
@@ -461,7 +461,7 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
   manualDraw = null
   const minM = milesToMeters(req.distanceMiles)
   const maxM = milesToMeters(req.distanceMiles + req.varianceMiles)
-  const maxElevChangeM = req.maxElevationChangeFeet / 3.28084
+  const maxClimbM = req.maxClimbFeet / 3.28084
 
   const radiusM = Math.min(5000, Math.max(1100, minM * 0.7))
 
@@ -504,7 +504,7 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
   const consider = (
     candidate: RouteCandidate | null,
     scoreMaxM = maxM,
-    scoreElev = maxElevChangeM,
+    scoreClimb = maxClimbM,
   ) => {
     if (!candidate || candidate.path.length < 3) return
     const gap =
@@ -519,7 +519,7 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
       { ...candidate, kind: candidate.kind },
       minM,
       scoreMaxM,
-      scoreElev,
+      scoreClimb,
     )
     if (s > search.bestScore) {
       search.bestScore = s
@@ -609,12 +609,12 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
           consider(
             tryTwoLegLoop(graph, startId, farId, softWeights, findPath),
             maxM * 1.25,
-            maxElevChangeM * 1.4,
+            maxClimbM * 1.4,
           )
           consider(
             tryOutAndBack(graph, startId, farId, softWeights, findPath),
             maxM * 1.25,
-            maxElevChangeM * 1.4,
+            maxClimbM * 1.4,
           )
         }
       }
