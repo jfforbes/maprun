@@ -211,6 +211,46 @@ input {
   color: #eef7f1;
 }
 
+.btn.ghost {
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid var(--line);
+}
+
+.btn.ghost:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 10%, white);
+}
+
+.btn-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.55rem;
+}
+
+.draw-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.waypoint-marker {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #1f6f4a;
+  border: 2px solid #f4faf6;
+  color: #f4faf6;
+  font-size: 0.7rem;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+  box-shadow: 0 4px 12px rgba(20, 32, 24, 0.3);
+}
+
+.run-map.mode-draw {
+  cursor: crosshair;
+}
+
 .status,
 .error {
   margin: 0;

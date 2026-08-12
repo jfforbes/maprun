@@ -5,8 +5,13 @@ import { geocodeAddress, type GeocodeResult } from './lib/geocode'
 import { buildGpx, downloadGpx } from './lib/gpx'
 import type { LatLng } from './lib/geo'
 import {
+  addManualWaypoint,
+  beginManualRoute,
+  cancelManualRoute,
   dragRouteHandle,
+  finishManualAtStart,
   planRunRoute,
+  undoManualWaypoint,
   type RouteResult,
 } from './lib/router'
 
@@ -30,11 +35,15 @@ export default function App() {
   const [resolvedLabel, setResolvedLabel] = useState<string | null>(null)
   const [pickedFromSuggestions, setPickedFromSuggestions] = useState(false)
   const [route, setRoute] = useState<RouteResult | null>(null)
+  const [drawing, setDrawing] = useState(false)
   const [status, setStatus] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
   const canExport = Boolean(route?.coordinates.length)
+  const mapMode = drawing ? 'draw' : route ? 'view' : 'pick-start'
+
+  const canStart = Boolean(start || form.location.trim())
 
   const summary = useMemo(() => {
     if (!route) return null
@@ -52,6 +61,8 @@ export default function App() {
   }, [route])
 
   function applyLocation(result: GeocodeResult) {
+    cancelManualRoute()
+    setDrawing(false)
     setStart(result.location)
     setResolvedLabel(result.label)
     setForm((f) => ({ ...f, location: result.label }))
@@ -60,12 +71,111 @@ export default function App() {
   }
 
   function onPickStart(point: LatLng) {
+    cancelManualRoute()
+    setDrawing(false)
     const label = `${point.lat.toFixed(5)}, ${point.lng.toFixed(5)}`
     setStart(point)
     setResolvedLabel(label)
     setForm((f) => ({ ...f, location: label }))
     setPickedFromSuggestions(true)
     setRoute(null)
+  }
+
+  async function ensureStart(): Promise<LatLng> {
+    let origin = start
+    const typed = form.location.trim()
+    if (!typed && !origin) {
+      throw new Error('Enter a starting location or click the map.')
+    }
+    if (!origin || !pickedFromSuggestions) {
+      if (!typed) throw new Error('Enter a starting location or click the map.')
+      const result = await geocodeAddress(typed)
+      applyLocation(result)
+      origin = result.location
+    }
+    return origin
+  }
+
+  async function onStartDrawing() {
+    setError(null)
+    setBusy(true)
+    try {
+      setStatus('Preparing draw mode…')
+      const origin = await ensureStart()
+      const hint = Number(form.distanceMiles)
+      await beginManualRoute(
+        origin,
+        Number.isFinite(hint) && hint > 0 ? hint : 5,
+        setStatus,
+      )
+      setRoute(null)
+      setDrawing(true)
+      setStatus('Click the map to add waypoints. Streets will connect them.')
+    } catch (err) {
+      setStatus(null)
+      setError(err instanceof Error ? err.message : 'Could not start drawing.')
+      setDrawing(false)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function onDrawClick(point: LatLng) {
+    if (!drawing || busy) return
+    setError(null)
+    setBusy(true)
+    try {
+      const result = await addManualWaypoint(point)
+      setRoute(result)
+      setStatus('Click to add another point, or return to start.')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not add that point.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function onUndoWaypoint() {
+    setError(null)
+    setBusy(true)
+    try {
+      const result = await undoManualWaypoint()
+      setRoute(result)
+      setStatus(
+        result
+          ? 'Click to add another point, or return to start.'
+          : 'Click the map to add waypoints.',
+      )
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not undo.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function onFinishAtStart() {
+    setError(null)
+    setBusy(true)
+    setStatus('Routing back to start…')
+    try {
+      const result = await finishManualAtStart()
+      setRoute(result)
+      setDrawing(false)
+      setStatus(null)
+    } catch (err) {
+      setStatus(null)
+      setError(err instanceof Error ? err.message : 'Could not finish route.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function onCancelDrawing() {
+    cancelManualRoute()
+    setDrawing(false)
+    setRoute(null)
+    setStatus(null)
+    setError(null)
   }
 
   async function onDragHandle(handleIndex: number, point: LatLng) {
@@ -88,6 +198,8 @@ export default function App() {
     e.preventDefault()
     setError(null)
     setRoute(null)
+    cancelManualRoute()
+    setDrawing(false)
 
     const distanceMiles = Number(form.distanceMiles)
     const varianceMiles = Number(form.varianceMiles)
@@ -113,17 +225,7 @@ export default function App() {
     setBusy(true)
     try {
       setStatus('Resolving start…')
-      let origin = start
-      const typed = form.location.trim()
-      if (!typed) {
-        throw new Error('Enter a starting location or click the map.')
-      }
-
-      if (!origin || !pickedFromSuggestions) {
-        const result = await geocodeAddress(typed)
-        applyLocation(result)
-        origin = result.location
-      }
+      const origin = await ensureStart()
 
       const result = await planRunRoute({
         start: origin,
@@ -186,6 +288,7 @@ export default function App() {
                 min="0.5"
                 step="0.1"
                 value={form.distanceMiles}
+                disabled={drawing}
                 onChange={(e) =>
                   setForm({ ...form, distanceMiles: e.target.value })
                 }
@@ -198,6 +301,7 @@ export default function App() {
                 min="0"
                 step="0.1"
                 value={form.varianceMiles}
+                disabled={drawing}
                 onChange={(e) =>
                   setForm({ ...form, varianceMiles: e.target.value })
                 }
@@ -212,19 +316,64 @@ export default function App() {
               min="0"
               step="10"
               value={form.maxElevationFeet}
+              disabled={drawing}
               onChange={(e) =>
                 setForm({ ...form, maxElevationFeet: e.target.value })
               }
             />
             <em className="field-hint">
-              Caps total up + down (gain and loss combined). Prefers a loop;
-              out-and-back is a backup. Drag green handles on the map to reshape.
+              Caps total up + down for auto routes. Or draw your own after
+              picking a start — same stats either way.
             </em>
           </label>
 
-          <button className="btn primary" type="submit" disabled={busy}>
-            {busy ? 'Routing…' : 'Route run'}
-          </button>
+          {!drawing ? (
+            <div className="btn-row">
+              <button className="btn primary" type="submit" disabled={busy || !canStart}>
+                {busy ? 'Routing…' : 'Auto route'}
+              </button>
+              <button
+                className="btn ghost"
+                type="button"
+                disabled={busy || !canStart}
+                onClick={onStartDrawing}
+              >
+                Draw my own
+              </button>
+            </div>
+          ) : (
+            <div className="draw-controls">
+              <p className="field-hint">
+                Click the map to drop waypoints. Each segment follows streets.
+              </p>
+              <div className="btn-row">
+                <button
+                  className="btn ghost"
+                  type="button"
+                  disabled={busy || !route}
+                  onClick={onUndoWaypoint}
+                >
+                  Undo point
+                </button>
+                <button
+                  className="btn primary"
+                  type="button"
+                  disabled={busy || !route}
+                  onClick={onFinishAtStart}
+                >
+                  Return to start
+                </button>
+              </div>
+              <button
+                className="btn ghost"
+                type="button"
+                disabled={busy}
+                onClick={onCancelDrawing}
+              >
+                Cancel drawing
+              </button>
+            </div>
+          )}
         </form>
 
         {status && <p className="status">{status}</p>}
@@ -263,8 +412,10 @@ export default function App() {
           start={start}
           route={route?.coordinates ?? null}
           controlPoints={route?.controlPoints ?? null}
-          allowPickStart={!route}
+          waypoints={route?.waypoints ?? null}
+          mode={mapMode}
           onPickStart={onPickStart}
+          onDrawClick={onDrawClick}
           onDragHandle={onDragHandle}
         />
       </main>

@@ -53,9 +53,11 @@ export type RouteResult = {
   label: string
   /** Mid-route handles the user can drag (excludes fixed start/end). */
   controlPoints: LatLng[]
+  /** Explicit click waypoints while drawing manually (includes start). */
+  waypoints?: LatLng[]
 }
 
-type RouteKind = 'loop' | 'out-and-back' | 'edited'
+type RouteKind = 'loop' | 'out-and-back' | 'edited' | 'manual'
 
 type RouteCandidate = {
   kind: RouteKind
@@ -85,10 +87,24 @@ export type RouteSession = {
   start: LatLng
 }
 
+type ManualDrawState = {
+  graph: RunGraph
+  start: LatLng
+  startId: number
+  /** Waypoint node ids in click order (starts with startId). */
+  waypointIds: number[]
+  nodePath: number[]
+}
+
 let activeSession: RouteSession | null = null
+let manualDraw: ManualDrawState | null = null
 
 export function getActiveSession(): RouteSession | null {
   return activeSession
+}
+
+export function isManualDrawing(): boolean {
+  return manualDraw !== null
 }
 
 function densify(points: LatLng[], maxStepM = 40): LatLng[] {
@@ -368,9 +384,12 @@ async function finalizeRoute(
   candidate: RouteCandidate,
   start: LatLng,
   minDistanceMiles: number,
+  options?: { waypoints?: LatLng[] },
 ): Promise<RouteResult> {
   let coordinates = pathToLatLng(graph, candidate.path)
+  // Only force-close auto loops that didn't quite snap back
   if (
+    candidate.kind === 'loop' &&
     coordinates.length &&
     haversineMeters(coordinates[0], coordinates[coordinates.length - 1]) > 15
   ) {
@@ -394,7 +413,7 @@ async function finalizeRoute(
   const elevMin = Math.min(...elevationsM)
   const elevMax = Math.max(...elevationsM)
 
-  if (distanceMiles < minDistanceMiles) {
+  if (minDistanceMiles > 0 && distanceMiles < minDistanceMiles) {
     throw new Error(
       `Routed distance came out under target (${distanceMiles.toFixed(2)} mi). Try increasing variance slightly.`,
     )
@@ -414,7 +433,9 @@ async function finalizeRoute(
       ? 'Out and back'
       : candidate.kind === 'edited'
         ? 'Edited route'
-        : 'Loop'
+        : candidate.kind === 'manual'
+          ? 'Manual route'
+          : 'Loop'
 
   return {
     coordinates: dense,
@@ -429,11 +450,13 @@ async function finalizeRoute(
     turns: candidate.turns,
     label,
     controlPoints: controlPointsFromSession(activeSession),
+    waypoints: options?.waypoints,
   }
 }
 
 export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
   const status = req.onStatus ?? (() => {})
+  manualDraw = null
   const minM = milesToMeters(req.distanceMiles)
   const maxM = milesToMeters(req.distanceMiles + req.varianceMiles)
   const maxElevChangeM = req.maxElevationChangeFeet / 3.28084
@@ -686,4 +709,178 @@ export async function dragRouteHandle(
   }
 
   return finalizeRoute(session.graph, candidate, session.start, 0)
+}
+
+function candidateFromNodePath(
+  graph: RunGraph,
+  nodePath: number[],
+  kind: RouteKind,
+): RouteCandidate {
+  const elev = elevAlongPath(graph, nodePath)
+  const hazards = countPathHazards(graph, nodePath)
+  let lengthM = 0
+  let turns = 0
+  let prevBearing: number | null = null
+  for (let i = 0; i < nodePath.length - 1; i++) {
+    const edge = (graph.adj.get(nodePath[i]) ?? []).find(
+      (e) => e.to === nodePath[i + 1],
+    )
+    if (!edge) continue
+    lengthM += edge.lengthM
+    if (prevBearing !== null) {
+      const delta = turnAngleDegrees(prevBearing, edge.bearing)
+      if (delta > 25) turns += 1
+    }
+    prevBearing = edge.bearing
+  }
+  return {
+    kind,
+    path: nodePath,
+    lengthM,
+    elevGainM: elev.gain,
+    elevLossM: elev.loss,
+    signals: hazards.signals,
+    crossings: hazards.crossings,
+    turns,
+  }
+}
+
+function manualWaypoints(state: ManualDrawState): LatLng[] {
+  return state.waypointIds
+    .map((id) => state.graph.nodePos.get(id))
+    .filter((p): p is LatLng => Boolean(p))
+}
+
+async function finalizeManual(state: ManualDrawState): Promise<RouteResult> {
+  const candidate = candidateFromNodePath(state.graph, state.nodePath, 'manual')
+  return finalizeRoute(state.graph, candidate, state.start, 0, {
+    waypoints: manualWaypoints(state),
+  })
+}
+
+/** Load the street graph and start click-to-draw from this start point. */
+export async function beginManualRoute(
+  start: LatLng,
+  distanceHintMiles = 5,
+  onStatus?: (message: string) => void,
+): Promise<void> {
+  const status = onStatus ?? (() => {})
+  const radiusM = Math.min(
+    6000,
+    Math.max(1500, milesToMeters(distanceHintMiles) * 0.75),
+  )
+
+  status('Loading streets for drawing…')
+  const network = await fetchOsmNetwork(start, radiusM)
+  if (network.ways.length < 5) {
+    throw new Error('Not enough walkable roads near that start point.')
+  }
+
+  status('Reading elevation…')
+  const elevByNode = await elevationsForNetwork(network)
+  const graph = buildGraph(network, elevByNode)
+  const startId = nearestNodeId(network, start, 300)
+  if (startId === null || !graph.adj.has(startId)) {
+    throw new Error('Could not snap the start point to a walkable road.')
+  }
+
+  manualDraw = {
+    graph,
+    start,
+    startId,
+    waypointIds: [startId],
+    nodePath: [startId],
+  }
+  activeSession = null
+  status('Click the map to add waypoints along streets.')
+}
+
+/** Add a clicked waypoint; routes along streets from the previous point. */
+export async function addManualWaypoint(point: LatLng): Promise<RouteResult> {
+  if (!manualDraw) {
+    throw new Error('Start drawing first.')
+  }
+
+  const snapped = nearestGraphNodeId(manualDraw.graph, point, 300)
+  if (snapped === null) {
+    throw new Error('Could not snap that click to a nearby path.')
+  }
+
+  const fromId = manualDraw.waypointIds[manualDraw.waypointIds.length - 1]
+  if (snapped === fromId) {
+    throw new Error('Pick a point farther along the route.')
+  }
+
+  const findPath = createDijkstraCache()
+  const leg = findPath(manualDraw.graph, fromId, snapped, DEFAULT_WEIGHTS)
+  if (!leg || leg.path.length < 2) {
+    throw new Error('Could not route to that point on the street network.')
+  }
+
+  manualDraw.waypointIds.push(snapped)
+  manualDraw.nodePath = mergePaths([manualDraw.nodePath, leg.path])
+  return finalizeManual(manualDraw)
+}
+
+/** Remove the last clicked waypoint (keeps start). */
+export async function undoManualWaypoint(): Promise<RouteResult | null> {
+  if (!manualDraw) return null
+  if (manualDraw.waypointIds.length <= 1) {
+    manualDraw.nodePath = [manualDraw.startId]
+    return null
+  }
+
+  manualDraw.waypointIds.pop()
+  // Rebuild path from remaining waypoints
+  const findPath = createDijkstraCache()
+  let path = [manualDraw.waypointIds[0]]
+  for (let i = 1; i < manualDraw.waypointIds.length; i++) {
+    const leg = findPath(
+      manualDraw.graph,
+      manualDraw.waypointIds[i - 1],
+      manualDraw.waypointIds[i],
+      DEFAULT_WEIGHTS,
+    )
+    if (!leg) throw new Error('Could not rebuild the route after undo.')
+    path = mergePaths([path, leg.path])
+  }
+  manualDraw.nodePath = path
+
+  if (manualDraw.waypointIds.length === 1) return null
+  return finalizeManual(manualDraw)
+}
+
+/** Route from the last waypoint back to the start to close a loop. */
+export async function finishManualAtStart(): Promise<RouteResult> {
+  if (!manualDraw) throw new Error('Start drawing first.')
+  if (manualDraw.waypointIds.length < 2) {
+    throw new Error('Add at least one waypoint before returning to start.')
+  }
+
+  const fromId = manualDraw.waypointIds[manualDraw.waypointIds.length - 1]
+  if (fromId === manualDraw.startId) {
+    return finalizeManual(manualDraw)
+  }
+
+  const findPath = createDijkstraCache()
+  const leg = findPath(
+    manualDraw.graph,
+    fromId,
+    manualDraw.startId,
+    DEFAULT_WEIGHTS,
+  )
+  if (!leg || leg.path.length < 2) {
+    throw new Error('Could not route back to the start.')
+  }
+
+  manualDraw.waypointIds.push(manualDraw.startId)
+  manualDraw.nodePath = mergePaths([manualDraw.nodePath, leg.path])
+  const result = await finalizeManual(manualDraw)
+  // Keep session for dragging; leave draw mode so further clicks don't add points
+  manualDraw = null
+  return result
+}
+
+export function cancelManualRoute(): void {
+  manualDraw = null
 }

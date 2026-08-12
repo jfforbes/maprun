@@ -19,8 +19,10 @@ type Props = {
   start: LatLng | null
   route: LatLng[] | null
   controlPoints?: LatLng[] | null
-  allowPickStart?: boolean
+  waypoints?: LatLng[] | null
+  mode?: 'pick-start' | 'draw' | 'view'
   onPickStart?: (point: LatLng) => void
+  onDrawClick?: (point: LatLng) => void
   onDragHandle?: (handleIndex: number, point: LatLng) => void
 }
 
@@ -31,20 +33,25 @@ export function RunMap({
   start,
   route,
   controlPoints,
-  allowPickStart = true,
+  waypoints,
+  mode = 'pick-start',
   onPickStart,
+  onDrawClick,
   onDragHandle,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<Map | null>(null)
   const markerRef = useRef<Marker | null>(null)
   const handleMarkersRef = useRef<Marker[]>([])
+  const waypointMarkersRef = useRef<Marker[]>([])
+  const modeRef = useRef(mode)
   const onPickRef = useRef(onPickStart)
+  const onDrawRef = useRef(onDrawClick)
   const onDragRef = useRef(onDragHandle)
-  const allowPickRef = useRef(allowPickStart)
+  modeRef.current = mode
   onPickRef.current = onPickStart
+  onDrawRef.current = onDrawClick
   onDragRef.current = onDragHandle
-  allowPickRef.current = allowPickStart
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return
@@ -59,8 +66,12 @@ export function RunMap({
     map.addControl(new NavigationControl({ showCompass: false }), 'top-right')
 
     map.on('click', (e: MapMouseEvent) => {
-      if (!allowPickRef.current) return
-      onPickRef.current?.({ lat: e.lngLat.lat, lng: e.lngLat.lng })
+      const point = { lat: e.lngLat.lat, lng: e.lngLat.lng }
+      if (modeRef.current === 'pick-start') {
+        onPickRef.current?.(point)
+      } else if (modeRef.current === 'draw') {
+        onDrawRef.current?.(point)
+      }
     })
 
     map.on('load', () => {
@@ -88,7 +99,9 @@ export function RunMap({
     return () => {
       markerRef.current?.remove()
       for (const m of handleMarkersRef.current) m.remove()
+      for (const m of waypointMarkersRef.current) m.remove()
       handleMarkersRef.current = []
+      waypointMarkersRef.current = []
       map.remove()
       mapRef.current = null
     }
@@ -135,9 +148,11 @@ export function RunMap({
         },
       })
 
-      const bounds = new LngLatBounds()
-      for (const p of route) bounds.extend([p.lng, p.lat])
-      map.fitBounds(bounds, { padding: 64, duration: 800, maxZoom: 15 })
+      if (modeRef.current !== 'draw') {
+        const bounds = new LngLatBounds()
+        for (const p of route) bounds.extend([p.lng, p.lat])
+        map.fitBounds(bounds, { padding: 64, duration: 800, maxZoom: 15 })
+      }
     }
 
     if (map.isStyleLoaded()) apply()
@@ -151,7 +166,7 @@ export function RunMap({
     for (const m of handleMarkersRef.current) m.remove()
     handleMarkersRef.current = []
 
-    if (!controlPoints?.length) return
+    if (!controlPoints?.length || mode === 'draw') return
 
     controlPoints.forEach((point, index) => {
       const el = document.createElement('div')
@@ -168,9 +183,30 @@ export function RunMap({
 
       handleMarkersRef.current.push(marker)
     })
-  }, [controlPoints])
+  }, [controlPoints, mode])
 
-  return <div ref={containerRef} className="run-map" role="presentation" />
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+
+    for (const m of waypointMarkersRef.current) m.remove()
+    waypointMarkersRef.current = []
+
+    if (!waypoints?.length) return
+
+    waypoints.forEach((point, index) => {
+      if (index === 0) return // start marker already shown
+      const el = document.createElement('div')
+      el.className = 'waypoint-marker'
+      el.textContent = String(index)
+      const marker = new Marker({ element: el })
+        .setLngLat([point.lng, point.lat])
+        .addTo(map)
+      waypointMarkersRef.current.push(marker)
+    })
+  }, [waypoints])
+
+  return <div ref={containerRef} className={`run-map mode-${mode}`} role="presentation" />
 }
 
 function emptyLine(): Feature {
