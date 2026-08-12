@@ -114,7 +114,7 @@ export function AddressAutocomplete({
           if (suggestions.length) setOpen(true)
         }}
         onKeyDown={onKeyDown}
-        placeholder="Address or click the map"
+        placeholder="Address or tap the map"
         autoComplete="off"
         role="combobox"
         aria-expanded={open}
