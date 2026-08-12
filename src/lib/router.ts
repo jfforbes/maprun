@@ -131,6 +131,7 @@ function scoreRoute(
     signals: number
     crossings: number
     turns: number
+    kind?: RouteKind
   },
   minM: number,
   maxM: number,
@@ -143,9 +144,12 @@ function scoreRoute(
 
   const lengthTarget = minM + Math.min(maxM - minM, minM * 0.08) * 0.5
   const lengthScore = -Math.abs(stats.lengthM - lengthTarget) / 40
+  // Soft preference for loops when both are in range
+  const loopBonus = stats.kind === 'loop' ? 40 : 0
 
   return (
-    lengthScore -
+    lengthScore +
+    loopBonus -
     under * 2.5 -
     over / 18 -
     elevOver * 5 -
@@ -470,7 +474,12 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
       search.closestGap = gap
       search.closest = candidate
     }
-    const s = scoreRoute(candidate, minM, scoreMaxM, scoreElev)
+    const s = scoreRoute(
+      { ...candidate, kind: candidate.kind },
+      minM,
+      scoreMaxM,
+      scoreElev,
+    )
     if (s > search.bestScore) {
       search.bestScore = s
       search.best = candidate
@@ -479,20 +488,32 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
 
   let attempts = 0
 
-  // Pass 1: same-path out-and-backs only (fast + matches classic turnaround runs)
+  // Pass 1: loops first (two-leg + triangle)
   for (const weights of weightSets) {
     for (const bearing of bearings) {
-      if (++attempts % 8 === 0) await yieldToUi()
-      for (const radius of outAndBackRadii) {
+      if (++attempts % 6 === 0) await yieldToUi()
+      for (const radius of loopRadii) {
         const farPoint = destinationPoint(req.start, bearing, radius)
-        for (const farId of findNearbyNodes(graph, farPoint, 3)) {
+        for (const farId of findNearbyNodes(graph, farPoint, 2)) {
           if (farId === startId) continue
-          consider(tryOutAndBack(graph, startId, farId, weights, findPath))
+          consider(tryTwoLegLoop(graph, startId, farId, weights, findPath))
+        }
+
+        const aPoint = destinationPoint(req.start, bearing, radius)
+        const bPoint = destinationPoint(req.start, bearing + 100, radius * 0.95)
+        const aIds = findNearbyNodes(graph, aPoint, 2)
+        const bIds = findNearbyNodes(graph, bPoint, 2)
+        for (const aId of aIds) {
+          for (const bId of bIds) {
+            if (aId === startId || bId === startId || aId === bId) continue
+            consider(tryThreeLegLoop(graph, startId, aId, bId, weights, findPath))
+          }
         }
       }
     }
     if (
       search.best &&
+      search.best.kind === 'loop' &&
       displayMiles(search.best.lengthM) >= req.distanceMiles &&
       search.best.lengthM <= maxM
     ) {
@@ -500,32 +521,22 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
     }
   }
 
-  // Pass 2: loops only if out-and-back didn't land in range
+  // Pass 2: same-path out-and-back only if no good loop landed in range
   if (
     !search.best ||
+    search.best.kind !== 'loop' ||
     displayMiles(search.best.lengthM) < req.distanceMiles ||
     search.best.lengthM > maxM
   ) {
-    status('Trying loop alternatives…')
+    status('Trying out-and-back as backup…')
     for (const weights of weightSets) {
       for (const bearing of bearings) {
-        if (++attempts % 6 === 0) await yieldToUi()
-        for (const radius of loopRadii) {
+        if (++attempts % 8 === 0) await yieldToUi()
+        for (const radius of outAndBackRadii) {
           const farPoint = destinationPoint(req.start, bearing, radius)
-          for (const farId of findNearbyNodes(graph, farPoint, 2)) {
+          for (const farId of findNearbyNodes(graph, farPoint, 3)) {
             if (farId === startId) continue
-            consider(tryTwoLegLoop(graph, startId, farId, weights, findPath))
-          }
-
-          const aPoint = destinationPoint(req.start, bearing, radius)
-          const bPoint = destinationPoint(req.start, bearing + 100, radius * 0.95)
-          const aIds = findNearbyNodes(graph, aPoint, 2)
-          const bIds = findNearbyNodes(graph, bPoint, 2)
-          for (const aId of aIds) {
-            for (const bId of bIds) {
-              if (aId === startId || bId === startId || aId === bId) continue
-              consider(tryThreeLegLoop(graph, startId, aId, bId, weights, findPath))
-            }
+            consider(tryOutAndBack(graph, startId, farId, weights, findPath))
           }
         }
       }
@@ -551,6 +562,11 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
       for (const factor of [0.48, 0.55, 0.62]) {
         const farPoint = destinationPoint(req.start, bearing, minM * factor)
         for (const farId of findNearbyNodes(graph, farPoint, 3)) {
+          consider(
+            tryTwoLegLoop(graph, startId, farId, softWeights, findPath),
+            maxM * 1.25,
+            maxElevChangeM * 1.4,
+          )
           consider(
             tryOutAndBack(graph, startId, farId, softWeights, findPath),
             maxM * 1.25,

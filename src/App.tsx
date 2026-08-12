@@ -217,9 +217,8 @@ export default function App() {
               }
             />
             <em className="field-hint">
-              Caps total up + down (gain and loss combined). Prefers out-and-back
-              on the same path, or a loop. Drag green handles on the map to
-              reshape.
+              Caps total up + down (gain and loss combined). Prefers a loop;
+              out-and-back is a backup. Drag green handles on the map to reshape.
             </em>
           </label>
 
