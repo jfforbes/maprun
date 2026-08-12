@@ -377,9 +377,9 @@ export default function App() {
               }
             />
             <em className="field-hint">
-              Cumulative elevation gain only (descents ignored). Auto routes
-              try to stay under this; draw your own after picking a start if
-              you want full control.
+              Hard cap on cumulative elevation gain (descents ignored). Auto
+              routes must stay under this; draw your own after picking a start
+              if you want full control.
             </em>
           </label>
 

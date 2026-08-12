@@ -211,13 +211,15 @@ function scoreRoute(
     ? -Math.abs(stats.lengthM - lengthTarget) / 120
     : -Math.abs(stats.lengthM - lengthTarget) / 40
   const loopBonus = stats.kind === 'loop' ? 30 : 0
+  // Hard preference: every meter over climb budget is expensive
+  const climbPenalty = climbOver > 0 ? 400 + climbOver * 40 : 0
 
   return (
     lengthScore +
     loopBonus -
     under * 2.5 -
     over / 18 -
-    climbOver * 8 -
+    climbPenalty -
     // Each light is a major penalty vs small length differences
     stats.signals * 280 -
     stats.crossings * 5 -
@@ -457,16 +459,28 @@ function pickDiverseCandidates(
   ranked: RankedCandidate[],
   count: number,
   minDistanceMiles: number,
+  maxClimbM?: number,
 ): RouteCandidate[] {
   const sorted = [...ranked].sort((a, b) => b.score - a.score)
   const picked: { candidate: RouteCandidate; edges: Set<string> }[] = []
 
-  const tryPick = (maxOverlap: number, requireDistance: boolean) => {
+  const tryPick = (
+    maxOverlap: number,
+    requireDistance: boolean,
+    requireClimb: boolean,
+  ) => {
     for (const entry of sorted) {
       if (picked.length >= count) return
       if (
         requireDistance &&
         displayMiles(entry.candidate.lengthM) < minDistanceMiles
+      ) {
+        continue
+      }
+      if (
+        requireClimb &&
+        maxClimbM !== undefined &&
+        entry.candidate.elevGainM > maxClimbM + 0.5
       ) {
         continue
       }
@@ -478,9 +492,9 @@ function pickDiverseCandidates(
     }
   }
 
-  tryPick(0.45, true)
-  if (picked.length < count) tryPick(0.65, true)
-  if (picked.length < count) tryPick(0.8, false)
+  tryPick(0.45, true, true)
+  if (picked.length < count) tryPick(0.65, true, true)
+  if (picked.length < count) tryPick(0.8, true, true)
 
   return picked.map((p) => p.candidate)
 }
@@ -633,6 +647,9 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
     scoreClimb = maxClimbM,
   ) => {
     if (!candidate || candidate.path.length < 3) return
+    // Hard climb cap during search (graph-estimated gain)
+    if (candidate.elevGainM > scoreClimb + 0.5) return
+
     const gap =
       displayMiles(candidate.lengthM) < req.distanceMiles
         ? minM - candidate.lengthM
@@ -661,8 +678,12 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
   }
 
   const hasEnoughOptions = () =>
-    pickDiverseCandidates(ranked, optionCount, req.distanceMiles).length >=
-    optionCount
+    pickDiverseCandidates(
+      ranked,
+      optionCount,
+      req.distanceMiles,
+      maxClimbM,
+    ).length >= optionCount
 
   let attempts = 0
 
@@ -749,19 +770,24 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
           consider(
             tryTwoLegLoop(graph, startId, farId, softWeights, findPath),
             maxM * 1.25,
-            maxClimbM * 1.4,
+            maxClimbM,
           )
           consider(
             tryOutAndBack(graph, startId, farId, softWeights, findPath),
             maxM * 1.25,
-            maxClimbM * 1.4,
+            maxClimbM,
           )
         }
       }
     }
   }
 
-  let selected = pickDiverseCandidates(ranked, optionCount, req.distanceMiles)
+  let selected = pickDiverseCandidates(
+    ranked,
+    optionCount,
+    req.distanceMiles,
+    maxClimbM,
+  )
   if (selected.length === 0 && search.best) selected = [search.best]
   if (selected.length === 0 && search.closest) selected = [search.closest]
 
@@ -769,7 +795,7 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
 
   if (!best || best.path.length < 3) {
     throw new Error(
-      'Could not build a route with those constraints. Try a larger variance or elevation budget.',
+      'Could not build a route under that climb budget. Try a higher max climb, shorter distance, or a flatter area.',
     )
   }
 
@@ -779,9 +805,17 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
     )
   }
 
-  // Keep only options that meet the distance floor
+  if (best.elevGainM > maxClimbM + 0.5) {
+    throw new Error(
+      `Could not stay under ${req.maxClimbFeet} ft climb (best graph estimate was ${Math.round(best.elevGainM * 3.28084)} ft). Raise max climb or shorten the run.`,
+    )
+  }
+
+  // Keep only options that meet distance + climb floors
   selected = selected.filter(
-    (c) => displayMiles(c.lengthM) >= req.distanceMiles,
+    (c) =>
+      displayMiles(c.lengthM) >= req.distanceMiles &&
+      c.elevGainM <= maxClimbM + 0.5,
   )
   if (selected.length === 0) selected = [best]
 
@@ -791,10 +825,20 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
       : 'Building map & elevation profile…',
   )
 
+  // Allow a little DEM noise vs graph estimate when validating final climb
+  const climbToleranceFt = 10
+  const maxFinalClimbFt = req.maxClimbFeet + climbToleranceFt
+
   const options: PlannedOption[] = []
+  let lowestFinalClimb: number | null = null
   for (const candidate of selected) {
     try {
       const built = await buildRouteResult(graph, candidate, req.distanceMiles)
+      const finalClimb = built.result.elevationGainFeet
+      if (lowestFinalClimb === null || finalClimb < lowestFinalClimb) {
+        lowestFinalClimb = finalClimb
+      }
+      if (finalClimb > maxFinalClimbFt) continue
       options.push({
         candidate,
         result: built.result,
@@ -806,8 +850,12 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
   }
 
   if (options.length === 0) {
+    const climbNote =
+      lowestFinalClimb !== null
+        ? ` Closest finished at ${Math.round(lowestFinalClimb)} ft climb.`
+        : ''
     throw new Error(
-      'Could not finalize a route with those constraints. Try a larger variance.',
+      `No route stayed under ${req.maxClimbFeet} ft climb.${climbNote} Raise max climb or shorten the run.`,
     )
   }
 

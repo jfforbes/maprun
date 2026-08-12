@@ -126,7 +126,7 @@ export const DEFAULT_WEIGHTS: PathCostWeights = {
   signalPenalty: 1000,
   // Crossings matter much less than lights/turns
   crossingPenalty: 15,
-  elevGainPenalty: 8,
+  elevGainPenalty: 14,
 }
 
 /** Direct street distance between clicks — used for manual drawing. */
