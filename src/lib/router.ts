@@ -15,6 +15,7 @@ import {
 import {
   buildGraph,
   collectEdgeKeys,
+  countPathHazards,
   createDijkstraCache,
   DEFAULT_WEIGHTS,
   nearestGraphNodeId,
@@ -142,10 +143,13 @@ function scoreRoute(
   const elevChange = stats.elevGainM + stats.elevLossM
   const elevOver = Math.max(0, elevChange - maxElevChangeM)
 
+  const inRange = under < 1 && over < 1
   const lengthTarget = minM + Math.min(maxM - minM, minM * 0.08) * 0.5
-  const lengthScore = -Math.abs(stats.lengthM - lengthTarget) / 40
-  // Soft preference for loops when both are in range
-  const loopBonus = stats.kind === 'loop' ? 40 : 0
+  // Once distance is satisfied, length differences matter less than lights
+  const lengthScore = inRange
+    ? -Math.abs(stats.lengthM - lengthTarget) / 120
+    : -Math.abs(stats.lengthM - lengthTarget) / 40
+  const loopBonus = stats.kind === 'loop' ? 30 : 0
 
   return (
     lengthScore +
@@ -153,24 +157,35 @@ function scoreRoute(
     under * 2.5 -
     over / 18 -
     elevOver * 5 -
-    stats.signals * 10 -
-    stats.crossings * 5 -
-    stats.turns * 1.5
+    // Each light is a major penalty vs small length differences
+    stats.signals * 280 -
+    stats.crossings * 25 -
+    stats.turns * 1.2
   )
 }
 
+function hazardsForCandidate(
+  graph: RunGraph,
+  path: number[],
+): { signals: number; crossings: number } {
+  return countPathHazards(graph, path)
+}
+
 function summarizePath(
+  graph: RunGraph,
   parts: DijkstraResult[],
   kind: RouteKind = 'loop',
 ): RouteCandidate {
+  const path = mergePaths(parts.map((p) => p.path))
+  const hazards = hazardsForCandidate(graph, path)
   return {
     kind,
-    path: mergePaths(parts.map((p) => p.path)),
+    path,
     lengthM: parts.reduce((s, p) => s + p.lengthM, 0),
     elevGainM: parts.reduce((s, p) => s + p.elevGainM, 0),
     elevLossM: parts.reduce((s, p) => s + p.elevLossM, 0),
-    signals: parts.reduce((s, p) => s + p.signals, 0),
-    crossings: parts.reduce((s, p) => s + p.crossings, 0),
+    signals: hazards.signals,
+    crossings: hazards.crossings,
     turns: parts.reduce((s, p) => s + p.turns, 0),
   }
 }
@@ -219,6 +234,7 @@ function tryOutAndBack(
   const backPath = [...out.path].reverse()
   const path = mergePaths([out.path, backPath])
   const back = elevAlongPath(graph, backPath)
+  const hazards = hazardsForCandidate(graph, path)
 
   return {
     kind: 'out-and-back',
@@ -226,8 +242,8 @@ function tryOutAndBack(
     lengthM: out.lengthM * 2,
     elevGainM: out.elevGainM + back.gain,
     elevLossM: out.elevLossM + back.loss,
-    signals: out.signals * 2,
-    crossings: out.crossings * 2,
+    signals: hazards.signals,
+    crossings: hazards.crossings,
     turns: out.turns * 2 + 1,
   }
 }
@@ -247,7 +263,7 @@ function tryTwoLegLoop(
   if (!back || back.path.length < 2) {
     return tryOutAndBack(graph, startId, farId, weights, findPath)
   }
-  return summarizePath([out, back], 'loop')
+  return summarizePath(graph, [out, back], 'loop')
 }
 
 function tryThreeLegLoop(
@@ -268,9 +284,9 @@ function tryThreeLegLoop(
   if (!leg3) {
     const leg3Any = findPath(graph, bId, startId, weights)
     if (!leg3Any) return null
-    return summarizePath([leg1, leg2, leg3Any], 'loop')
+    return summarizePath(graph, [leg1, leg2, leg3Any], 'loop')
   }
-  return summarizePath([leg1, leg2, leg3], 'loop')
+  return summarizePath(graph, [leg1, leg2, leg3], 'loop')
 }
 
 async function elevationsForNetwork(
@@ -450,7 +466,7 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
 
   const weightSets: PathCostWeights[] = [
     DEFAULT_WEIGHTS,
-    { ...DEFAULT_WEIGHTS, signalPenalty: 260, crossingPenalty: 140, turnPenalty: 35 },
+    { ...DEFAULT_WEIGHTS, signalPenalty: 1600, crossingPenalty: 180, turnPenalty: 25 },
   ]
 
   const search = {
@@ -515,7 +531,8 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
       search.best &&
       search.best.kind === 'loop' &&
       displayMiles(search.best.lengthM) >= req.distanceMiles &&
-      search.best.lengthM <= maxM
+      search.best.lengthM <= maxM &&
+      search.best.signals <= 1
     ) {
       break
     }
@@ -526,7 +543,8 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
     !search.best ||
     search.best.kind !== 'loop' ||
     displayMiles(search.best.lengthM) < req.distanceMiles ||
-    search.best.lengthM > maxM
+    search.best.lengthM > maxM ||
+    search.best.signals > 2
   ) {
     status('Trying out-and-back as backup…')
     for (const weights of weightSets) {
@@ -543,7 +561,8 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
       if (
         search.best &&
         displayMiles(search.best.lengthM) >= req.distanceMiles &&
-        search.best.lengthM <= maxM
+        search.best.lengthM <= maxM &&
+        search.best.signals <= 1
       ) {
         break
       }
@@ -554,8 +573,8 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
     status('Stretching the route to meet distance…')
     const softWeights: PathCostWeights = {
       turnPenalty: 10,
-      signalPenalty: 80,
-      crossingPenalty: 40,
+      signalPenalty: 700,
+      crossingPenalty: 100,
       elevGainPenalty: 2,
     }
     for (let bearing = 0; bearing < 360; bearing += 20) {
@@ -638,9 +657,8 @@ export async function dragRouteHandle(
 
   // Recompute simple stats from path edges
   const elev = elevAlongPath(session.graph, nodePath)
+  const hazards = countPathHazards(session.graph, nodePath)
   let lengthM = 0
-  let signals = 0
-  let crossings = 0
   let turns = 0
   let prevBearing: number | null = null
   for (let i = 0; i < nodePath.length - 1; i++) {
@@ -649,8 +667,6 @@ export async function dragRouteHandle(
     )
     if (!edge) continue
     lengthM += edge.lengthM
-    if (edge.hasSignal) signals += 1
-    if (edge.hasCrossing) crossings += 1
     if (prevBearing !== null) {
       const delta = turnAngleDegrees(prevBearing, edge.bearing)
       if (delta > 25) turns += 1
@@ -664,8 +680,8 @@ export async function dragRouteHandle(
     lengthM,
     elevGainM: elev.gain,
     elevLossM: elev.loss,
-    signals,
-    crossings,
+    signals: hazards.signals,
+    crossings: hazards.crossings,
     turns,
   }
 

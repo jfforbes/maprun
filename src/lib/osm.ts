@@ -108,6 +108,8 @@ out geom;
 [out:json][timeout:25];
 (
   node["highway"="traffic_signals"](around:${r},${center.lat},${center.lng});
+  node["crossing"="traffic_signals"](around:${r},${center.lat},${center.lng});
+  node["traffic_signals"](around:${r},${center.lat},${center.lng});
   node["highway"="crossing"](around:${r},${center.lat},${center.lng});
 );
 out body;
@@ -164,18 +166,11 @@ function parseNetwork(
     bucket: LatLng[],
   ) => {
     bucket.push(point)
-    let bestId: number | null = null
-    let bestDist = Infinity
+    // Tag every nearby graph vertex — intersections often have several nodes
     for (const node of nodes.values()) {
-      const d = haversineMeters(point, node)
-      if (d < bestDist) {
-        bestDist = d
-        bestId = node.id
+      if (haversineMeters(point, node) <= 45) {
+        node[flag] = true
       }
-    }
-    if (bestId !== null && bestDist <= 35) {
-      const node = nodes.get(bestId)
-      if (node) node[flag] = true
     }
   }
 
@@ -183,7 +178,11 @@ function parseNetwork(
     if (el.type !== 'node') continue
     const point = { lat: el.lat, lng: el.lon }
     const tags = el.tags ?? {}
-    if (tags.highway === 'traffic_signals') {
+    const isSignal =
+      tags.highway === 'traffic_signals' ||
+      tags.crossing === 'traffic_signals' ||
+      tags.traffic_signals !== undefined
+    if (isSignal) {
       markNear(point, 'isSignal', signals)
     }
     if (tags.highway === 'crossing' || tags.crossing !== undefined) {

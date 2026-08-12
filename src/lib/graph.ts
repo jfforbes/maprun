@@ -13,8 +13,10 @@ export type GraphEdge = {
   bearing: number
   elevGainM: number
   elevLossM: number
-  hasSignal: boolean
-  hasCrossing: boolean
+  /** True when arriving at a traffic-signal node */
+  entersSignal: boolean
+  /** True when arriving at a crossing node */
+  entersCrossing: boolean
   highway: string
 }
 
@@ -22,6 +24,8 @@ export type RunGraph = {
   adj: Map<number, GraphEdge[]>
   nodePos: Map<number, LatLng>
   elevations: Map<number, number>
+  signalNodes: Set<number>
+  crossingNodes: Set<number>
 }
 
 const FOOT_PREF: Record<string, number> = {
@@ -48,12 +52,16 @@ export function buildGraph(
   const connected = connectedNodeIds(network)
   const adj = new Map<number, GraphEdge[]>()
   const nodePos = new Map<number, LatLng>()
+  const signalNodes = new Set<number>()
+  const crossingNodes = new Set<number>()
 
   for (const id of connected) {
     const n = network.nodes.get(id)
     if (!n) continue
     nodePos.set(id, { lat: n.lat, lng: n.lng })
     adj.set(id, [])
+    if (n.isSignal) signalNodes.add(id)
+    if (n.isCrossing) crossingNodes.add(id)
   }
 
   const addEdge = (from: number, edge: GraphEdge) => {
@@ -76,8 +84,6 @@ export function buildGraph(
       const delta = elevB - elevA
       const bearing = bearingDegrees(a, b)
       const reverseBearing = bearingDegrees(b, a)
-      const hasSignal = a.isSignal || b.isSignal
-      const hasCrossing = a.isCrossing || b.isCrossing
 
       addEdge(aId, {
         to: bId,
@@ -85,8 +91,8 @@ export function buildGraph(
         bearing,
         elevGainM: Math.max(0, delta),
         elevLossM: Math.max(0, -delta),
-        hasSignal,
-        hasCrossing,
+        entersSignal: signalNodes.has(bId),
+        entersCrossing: crossingNodes.has(bId),
         highway: way.highway,
       })
       addEdge(bId, {
@@ -95,14 +101,14 @@ export function buildGraph(
         bearing: reverseBearing,
         elevGainM: Math.max(0, -delta),
         elevLossM: Math.max(0, delta),
-        hasSignal,
-        hasCrossing,
+        entersSignal: signalNodes.has(aId),
+        entersCrossing: crossingNodes.has(aId),
         highway: way.highway,
       })
     }
   }
 
-  return { adj, nodePos, elevations }
+  return { adj, nodePos, elevations, signalNodes, crossingNodes }
 }
 
 export type PathCostWeights = {
@@ -113,9 +119,10 @@ export type PathCostWeights = {
 }
 
 export const DEFAULT_WEIGHTS: PathCostWeights = {
-  turnPenalty: 25,
-  signalPenalty: 180,
-  crossingPenalty: 90,
+  turnPenalty: 20,
+  // ~1km detour equivalent — lights should lose to quieter longer paths
+  signalPenalty: 1000,
+  crossingPenalty: 120,
   elevGainPenalty: 8,
 }
 
@@ -264,8 +271,8 @@ export function dijkstra(
       const stepCost =
         edge.lengthM * highwayMul +
         (turn / 45) * weights.turnPenalty +
-        (edge.hasSignal ? weights.signalPenalty : 0) +
-        (edge.hasCrossing ? weights.crossingPenalty : 0) +
+        (edge.entersSignal ? weights.signalPenalty : 0) +
+        (edge.entersCrossing ? weights.crossingPenalty : 0) +
         edge.elevGainM * weights.elevGainPenalty
 
       const nextCost = cur.cost + stepCost
@@ -275,8 +282,8 @@ export function dijkstra(
         lengthM: cur.lengthM + edge.lengthM,
         elevGainM: cur.elevGainM + edge.elevGainM,
         elevLossM: cur.elevLossM + edge.elevLossM,
-        signals: cur.signals + (edge.hasSignal ? 1 : 0),
-        crossings: cur.crossings + (edge.hasCrossing ? 1 : 0),
+        signals: cur.signals + (edge.entersSignal ? 1 : 0),
+        crossings: cur.crossings + (edge.entersCrossing ? 1 : 0),
         turns: cur.turns + turnCount,
         bearing: edge.bearing,
       }
@@ -373,6 +380,22 @@ export function nearestGraphNodeId(
   }
   if (bestId === null || bestDist > maxM) return null
   return bestId
+}
+
+export function countPathHazards(
+  graph: RunGraph,
+  path: number[],
+): { signals: number; crossings: number } {
+  let signals = 0
+  let crossings = 0
+  const seen = new Set<number>()
+  for (const id of path) {
+    if (seen.has(id)) continue
+    seen.add(id)
+    if (graph.signalNodes.has(id)) signals += 1
+    if (graph.crossingNodes.has(id)) crossings += 1
+  }
+  return { signals, crossings }
 }
 
 /** Soften repeated edge use when stitching loop legs */
