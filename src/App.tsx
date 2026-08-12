@@ -377,9 +377,8 @@ export default function App() {
               }
             />
             <em className="field-hint">
-              Hard cap on cumulative elevation gain (descents ignored). Auto
-              routes must stay under this; draw your own after picking a start
-              if you want full control.
+              Cumulative elevation gain only (descents ignored). Auto routes
+              prioritize lower climb first, then lights, turns, and crossings.
             </em>
           </label>
 
@@ -491,8 +490,8 @@ export default function App() {
         )}
 
         <footer className="panel-foot">
-          Prefers fewer lights and sharp turns (over 60°). Built on
-          OpenStreetMap.
+          Prefers lower climb first, then fewer lights, turns, and crossings.
+          Built on OpenStreetMap.
         </footer>
         </div>
       </aside>

@@ -121,12 +121,11 @@ export type PathCostWeights = {
 }
 
 export const DEFAULT_WEIGHTS: PathCostWeights = {
-  // Strong preference to keep going straight; only big bends count as turns
-  turnPenalty: 90,
-  signalPenalty: 1000,
-  // Crossings matter much less than lights/turns
-  crossingPenalty: 15,
-  elevGainPenalty: 14,
+  // Path cost priority: climb >> lights >> turns >> crossings
+  elevGainPenalty: 120,
+  signalPenalty: 250,
+  turnPenalty: 35,
+  crossingPenalty: 5,
 }
 
 /** Direct street distance between clicks — used for manual drawing. */

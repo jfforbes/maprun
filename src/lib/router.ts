@@ -206,24 +206,31 @@ function scoreRoute(
 
   const inRange = under < 1 && over < 1
   const lengthTarget = minM + Math.min(maxM - minM, minM * 0.08) * 0.5
-  // Once distance is satisfied, length differences matter less than lights
+  // Tiny length preference once distance is satisfied
   const lengthScore = inRange
-    ? -Math.abs(stats.lengthM - lengthTarget) / 120
+    ? -Math.abs(stats.lengthM - lengthTarget) / 500
     : -Math.abs(stats.lengthM - lengthTarget) / 40
-  const loopBonus = stats.kind === 'loop' ? 30 : 0
-  // Hard preference: every meter over climb budget is expensive
-  const climbPenalty = climbOver > 0 ? 400 + climbOver * 40 : 0
+  const loopBonus = stats.kind === 'loop' ? 5 : 0
+
+  // Near-lexicographic preference once distance works:
+  // climb >> lights >> turns >> crossings
+  const W_DIST = 1_000_000
+  const W_CLIMB = 10_000
+  const W_LIGHT = 300
+  const W_TURN = 8
+  const W_CROSS = 1
 
   return (
     lengthScore +
     loopBonus -
-    under * 2.5 -
+    under * W_DIST -
     over / 18 -
-    climbPenalty -
-    // Each light is a major penalty vs small length differences
-    stats.signals * 280 -
-    stats.crossings * 5 -
-    stats.turns * 40
+    // Prefer less absolute climb; extra hit for exceeding the budget
+    stats.elevGainM * W_CLIMB -
+    climbOver * W_CLIMB * 2 -
+    stats.signals * W_LIGHT -
+    stats.turns * W_TURN -
+    stats.crossings * W_CROSS
   )
 }
 
@@ -459,28 +466,16 @@ function pickDiverseCandidates(
   ranked: RankedCandidate[],
   count: number,
   minDistanceMiles: number,
-  maxClimbM?: number,
 ): RouteCandidate[] {
   const sorted = [...ranked].sort((a, b) => b.score - a.score)
   const picked: { candidate: RouteCandidate; edges: Set<string> }[] = []
 
-  const tryPick = (
-    maxOverlap: number,
-    requireDistance: boolean,
-    requireClimb: boolean,
-  ) => {
+  const tryPick = (maxOverlap: number, requireDistance: boolean) => {
     for (const entry of sorted) {
       if (picked.length >= count) return
       if (
         requireDistance &&
         displayMiles(entry.candidate.lengthM) < minDistanceMiles
-      ) {
-        continue
-      }
-      if (
-        requireClimb &&
-        maxClimbM !== undefined &&
-        entry.candidate.elevGainM > maxClimbM + 0.5
       ) {
         continue
       }
@@ -492,9 +487,9 @@ function pickDiverseCandidates(
     }
   }
 
-  tryPick(0.45, true, true)
-  if (picked.length < count) tryPick(0.65, true, true)
-  if (picked.length < count) tryPick(0.8, true, true)
+  tryPick(0.45, true)
+  if (picked.length < count) tryPick(0.65, true)
+  if (picked.length < count) tryPick(0.8, false)
 
   return picked.map((p) => p.candidate)
 }
@@ -623,7 +618,7 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
 
   const weightSets: PathCostWeights[] = [
     DEFAULT_WEIGHTS,
-    { ...DEFAULT_WEIGHTS, signalPenalty: 1600, crossingPenalty: 20, turnPenalty: 140 },
+    { ...DEFAULT_WEIGHTS, elevGainPenalty: 180, signalPenalty: 400, turnPenalty: 50 },
   ]
 
   const ranked: RankedCandidate[] = []
@@ -647,9 +642,6 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
     scoreClimb = maxClimbM,
   ) => {
     if (!candidate || candidate.path.length < 3) return
-    // Hard climb cap during search (graph-estimated gain)
-    if (candidate.elevGainM > scoreClimb + 0.5) return
-
     const gap =
       displayMiles(candidate.lengthM) < req.distanceMiles
         ? minM - candidate.lengthM
@@ -678,12 +670,8 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
   }
 
   const hasEnoughOptions = () =>
-    pickDiverseCandidates(
-      ranked,
-      optionCount,
-      req.distanceMiles,
-      maxClimbM,
-    ).length >= optionCount
+    pickDiverseCandidates(ranked, optionCount, req.distanceMiles).length >=
+    optionCount
 
   let attempts = 0
 
@@ -758,10 +746,10 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
   if (!search.best || displayMiles(search.best.lengthM) < req.distanceMiles) {
     status('Stretching the route to meet distance…')
     const softWeights: PathCostWeights = {
-      turnPenalty: 70,
-      signalPenalty: 700,
-      crossingPenalty: 10,
-      elevGainPenalty: 2,
+      turnPenalty: 40,
+      signalPenalty: 500,
+      crossingPenalty: 8,
+      elevGainPenalty: 18,
     }
     for (let bearing = 0; bearing < 360; bearing += 20) {
       for (const factor of [0.48, 0.55, 0.62]) {
@@ -770,24 +758,19 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
           consider(
             tryTwoLegLoop(graph, startId, farId, softWeights, findPath),
             maxM * 1.25,
-            maxClimbM,
+            maxClimbM * 1.4,
           )
           consider(
             tryOutAndBack(graph, startId, farId, softWeights, findPath),
             maxM * 1.25,
-            maxClimbM,
+            maxClimbM * 1.4,
           )
         }
       }
     }
   }
 
-  let selected = pickDiverseCandidates(
-    ranked,
-    optionCount,
-    req.distanceMiles,
-    maxClimbM,
-  )
+  let selected = pickDiverseCandidates(ranked, optionCount, req.distanceMiles)
   if (selected.length === 0 && search.best) selected = [search.best]
   if (selected.length === 0 && search.closest) selected = [search.closest]
 
@@ -795,7 +778,7 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
 
   if (!best || best.path.length < 3) {
     throw new Error(
-      'Could not build a route under that climb budget. Try a higher max climb, shorter distance, or a flatter area.',
+      'Could not build a route with those constraints. Try a larger variance or elevation budget.',
     )
   }
 
@@ -805,17 +788,9 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
     )
   }
 
-  if (best.elevGainM > maxClimbM + 0.5) {
-    throw new Error(
-      `Could not stay under ${req.maxClimbFeet} ft climb (best graph estimate was ${Math.round(best.elevGainM * 3.28084)} ft). Raise max climb or shorten the run.`,
-    )
-  }
-
-  // Keep only options that meet distance + climb floors
+  // Keep only options that meet the distance floor
   selected = selected.filter(
-    (c) =>
-      displayMiles(c.lengthM) >= req.distanceMiles &&
-      c.elevGainM <= maxClimbM + 0.5,
+    (c) => displayMiles(c.lengthM) >= req.distanceMiles,
   )
   if (selected.length === 0) selected = [best]
 
@@ -825,20 +800,10 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
       : 'Building map & elevation profile…',
   )
 
-  // Allow a little DEM noise vs graph estimate when validating final climb
-  const climbToleranceFt = 10
-  const maxFinalClimbFt = req.maxClimbFeet + climbToleranceFt
-
   const options: PlannedOption[] = []
-  let lowestFinalClimb: number | null = null
   for (const candidate of selected) {
     try {
       const built = await buildRouteResult(graph, candidate, req.distanceMiles)
-      const finalClimb = built.result.elevationGainFeet
-      if (lowestFinalClimb === null || finalClimb < lowestFinalClimb) {
-        lowestFinalClimb = finalClimb
-      }
-      if (finalClimb > maxFinalClimbFt) continue
       options.push({
         candidate,
         result: built.result,
@@ -850,14 +815,21 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
   }
 
   if (options.length === 0) {
-    const climbNote =
-      lowestFinalClimb !== null
-        ? ` Closest finished at ${Math.round(lowestFinalClimb)} ft climb.`
-        : ''
     throw new Error(
-      `No route stayed under ${req.maxClimbFeet} ft climb.${climbNote} Raise max climb or shorten the run.`,
+      'Could not finalize a route with those constraints. Try a larger variance.',
     )
   }
+
+  // Re-rank by final measured climb, then lights, turns, crossings
+  options.sort((a, b) => {
+    const climb = a.result.elevationGainFeet - b.result.elevationGainFeet
+    if (Math.abs(climb) > 1) return climb
+    const lights = a.result.signals - b.result.signals
+    if (lights !== 0) return lights
+    const turns = a.result.turns - b.result.turns
+    if (turns !== 0) return turns
+    return a.result.crossings - b.result.crossings
+  })
 
   plannedBundle = { graph, start: req.start, options }
   activeSession = {
