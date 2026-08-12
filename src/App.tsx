@@ -1,4 +1,4 @@
-import { useMemo, useState, type FormEvent } from 'react'
+import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { AddressAutocomplete } from './components/AddressAutocomplete'
 import { RunMap } from './components/RunMap'
 import { geocodeAddress, type GeocodeResult } from './lib/geocode'
@@ -8,9 +8,11 @@ import {
   addManualWaypoint,
   beginManualRoute,
   cancelManualRoute,
+  clearPlannedRoutes,
   dragRouteHandle,
   finishManualAtStart,
   planRunRoute,
+  selectPlannedRoute,
   undoManualWaypoint,
   type RouteResult,
 } from './lib/router'
@@ -35,15 +37,22 @@ export default function App() {
   const [resolvedLabel, setResolvedLabel] = useState<string | null>(null)
   const [pickedFromSuggestions, setPickedFromSuggestions] = useState(false)
   const [route, setRoute] = useState<RouteResult | null>(null)
+  const [routeOptions, setRouteOptions] = useState<RouteResult[]>([])
+  const [selectedOption, setSelectedOption] = useState(0)
   const [drawing, setDrawing] = useState(false)
   const [status, setStatus] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [mapFocus, setMapFocus] = useState(false)
 
   const canExport = Boolean(route?.coordinates.length)
   const mapMode = drawing ? 'draw' : route ? 'view' : 'pick-start'
 
   const canStart = Boolean(start || form.location.trim())
+
+  useEffect(() => {
+    if (drawing) setMapFocus(true)
+  }, [drawing])
 
   const summary = useMemo(() => {
     if (!route) return null
@@ -60,6 +69,13 @@ export default function App() {
     ]
   }, [route])
 
+  function clearRoutes() {
+    setRoute(null)
+    setRouteOptions([])
+    setSelectedOption(0)
+    clearPlannedRoutes()
+  }
+
   function applyLocation(result: GeocodeResult) {
     cancelManualRoute()
     setDrawing(false)
@@ -67,7 +83,7 @@ export default function App() {
     setResolvedLabel(result.label)
     setForm((f) => ({ ...f, location: result.label }))
     setPickedFromSuggestions(true)
-    setRoute(null)
+    clearRoutes()
   }
 
   function onPickStart(point: LatLng) {
@@ -78,17 +94,17 @@ export default function App() {
     setResolvedLabel(label)
     setForm((f) => ({ ...f, location: label }))
     setPickedFromSuggestions(true)
-    setRoute(null)
+    clearRoutes()
   }
 
   async function ensureStart(): Promise<LatLng> {
     let origin = start
     const typed = form.location.trim()
     if (!typed && !origin) {
-      throw new Error('Enter a starting location or click the map.')
+      throw new Error('Enter a starting location or tap the map.')
     }
     if (!origin || !pickedFromSuggestions) {
-      if (!typed) throw new Error('Enter a starting location or click the map.')
+      if (!typed) throw new Error('Enter a starting location or tap the map.')
       const result = await geocodeAddress(typed)
       applyLocation(result)
       origin = result.location
@@ -109,6 +125,8 @@ export default function App() {
         setStatus,
       )
       setRoute(null)
+      setRouteOptions([])
+      setSelectedOption(0)
       setDrawing(true)
       setStatus('Click the map to add waypoints. Streets will connect them.')
     } catch (err) {
@@ -127,6 +145,8 @@ export default function App() {
     try {
       const result = await addManualWaypoint(point)
       setRoute(result)
+      setRouteOptions([])
+      setSelectedOption(0)
       setStatus('Click to add another point, or return to start.')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not add that point.')
@@ -141,6 +161,8 @@ export default function App() {
     try {
       const result = await undoManualWaypoint()
       setRoute(result)
+      setRouteOptions([])
+      setSelectedOption(0)
       setStatus(
         result
           ? 'Click to add another point, or return to start.'
@@ -160,6 +182,8 @@ export default function App() {
     try {
       const result = await finishManualAtStart()
       setRoute(result)
+      setRouteOptions([])
+      setSelectedOption(0)
       setDrawing(false)
       setStatus(null)
     } catch (err) {
@@ -173,7 +197,7 @@ export default function App() {
   function onCancelDrawing() {
     cancelManualRoute()
     setDrawing(false)
-    setRoute(null)
+    clearRoutes()
     setStatus(null)
     setError(null)
   }
@@ -185,6 +209,8 @@ export default function App() {
     try {
       const result = await dragRouteHandle(handleIndex, point)
       setRoute(result)
+      setRouteOptions([])
+      setSelectedOption(0)
       setStatus(null)
     } catch (err) {
       setStatus(null)
@@ -194,10 +220,22 @@ export default function App() {
     }
   }
 
+  function onSelectOption(index: number) {
+    if (index === selectedOption || busy) return
+    try {
+      const result = selectPlannedRoute(index)
+      setSelectedOption(index)
+      setRoute(result)
+      setError(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not switch routes.')
+    }
+  }
+
   async function onSubmit(e: FormEvent) {
     e.preventDefault()
     setError(null)
-    setRoute(null)
+    clearRoutes()
     cancelManualRoute()
     setDrawing(false)
 
@@ -227,7 +265,7 @@ export default function App() {
       setStatus('Resolving start…')
       const origin = await ensureStart()
 
-      const result = await planRunRoute({
+      const planned = await planRunRoute({
         start: origin,
         distanceMiles,
         varianceMiles,
@@ -235,7 +273,9 @@ export default function App() {
         onStatus: setStatus,
       })
 
-      setRoute(result)
+      setRouteOptions(planned.routes)
+      setSelectedOption(planned.selectedIndex)
+      setRoute(planned.routes[planned.selectedIndex] ?? null)
       setStatus(null)
     } catch (err) {
       setStatus(null)
@@ -256,13 +296,25 @@ export default function App() {
   }
 
   return (
-    <div className="app-shell">
-      <aside className="panel">
+    <div className={`app-shell${mapFocus ? ' map-focus' : ''}`}>
+      <aside className={`panel${mapFocus ? ' is-compact' : ''}`}>
         <header className="brand">
-          <p className="brand-mark">MapRun</p>
+          <div className="brand-row">
+            <p className="brand-mark">MapRun</p>
+            <button
+              className="btn ghost panel-toggle"
+              type="button"
+              onClick={() => setMapFocus((v) => !v)}
+              aria-expanded={!mapFocus}
+              aria-controls="route-controls"
+            >
+              {mapFocus ? 'Show controls' : 'Focus map'}
+            </button>
+          </div>
           <p className="brand-sub">Quiet routes. Exact miles. Exportable.</p>
         </header>
 
+        <div id="route-controls" className="panel-body">
         <form className="route-form" onSubmit={onSubmit}>
           <label className="field">
             <span>Starting location</span>
@@ -285,6 +337,7 @@ export default function App() {
               <span>Distance (mi)</span>
               <input
                 type="number"
+                inputMode="decimal"
                 min="0.5"
                 step="0.1"
                 value={form.distanceMiles}
@@ -298,6 +351,7 @@ export default function App() {
               <span>Variance (mi)</span>
               <input
                 type="number"
+                inputMode="decimal"
                 min="0"
                 step="0.1"
                 value={form.varianceMiles}
@@ -313,6 +367,7 @@ export default function App() {
             <span>Max climb (ft)</span>
             <input
               type="number"
+              inputMode="numeric"
               min="0"
               step="10"
               value={form.maxElevationFeet}
@@ -345,7 +400,7 @@ export default function App() {
           ) : (
             <div className="draw-controls">
               <p className="field-hint">
-                Click the map to drop waypoints. Each segment follows streets.
+                Tap the map to drop waypoints. Each segment follows streets.
               </p>
               <div className="btn-row">
                 <button
@@ -380,6 +435,39 @@ export default function App() {
         {status && <p className="status">{status}</p>}
         {error && <p className="error">{error}</p>}
 
+        {routeOptions.length > 1 && (
+          <section className="route-options" aria-label="Route options">
+            <h2>Choose a route</h2>
+            <div className="route-option-list">
+              {routeOptions.map((opt, index) => {
+                const active = index === selectedOption
+                return (
+                  <button
+                    key={`${opt.label}-${opt.distanceMiles}-${index}`}
+                    type="button"
+                    className={`route-option${active ? ' is-active' : ''}`}
+                    disabled={busy}
+                    aria-pressed={active}
+                    onClick={() => onSelectOption(index)}
+                  >
+                    <strong>
+                      Option {index + 1}
+                      {index === 0 ? ' · Best' : ''}
+                    </strong>
+                    <span>
+                      {opt.distanceMiles.toFixed(2)} mi ·{' '}
+                      {Math.round(opt.elevationGainFeet)} ft climb
+                    </span>
+                    <span>
+                      {opt.label} · {opt.signals} lights · {opt.turns} turns
+                    </span>
+                  </button>
+                )
+              })}
+            </div>
+          </section>
+        )}
+
         {summary && (
           <section className="stats" aria-live="polite">
             <h2>Route</h2>
@@ -406,12 +494,51 @@ export default function App() {
           Prefers fewer lights and sharp turns (over 60°). Built on
           OpenStreetMap.
         </footer>
+        </div>
       </aside>
 
       <main className="map-stage">
+        {mapFocus && (
+          <div className="map-chrome">
+            <button
+              className="btn primary map-chrome-btn"
+              type="button"
+              onClick={() => setMapFocus(false)}
+            >
+              Controls
+            </button>
+            {drawing && (
+              <div className="map-chrome-actions">
+                <button
+                  className="btn ghost map-chrome-btn"
+                  type="button"
+                  disabled={busy || !route}
+                  onClick={onUndoWaypoint}
+                >
+                  Undo
+                </button>
+                <button
+                  className="btn ghost map-chrome-btn"
+                  type="button"
+                  disabled={busy || !route}
+                  onClick={onFinishAtStart}
+                >
+                  Finish
+                </button>
+              </div>
+            )}
+          </div>
+        )}
         <RunMap
           start={start}
           route={route?.coordinates ?? null}
+          alternateRoutes={
+            routeOptions.length > 1
+              ? routeOptions
+                  .filter((_, i) => i !== selectedOption)
+                  .map((r) => r.coordinates)
+              : null
+          }
           controlPoints={route?.controlPoints ?? null}
           waypoints={route?.waypoints ?? null}
           mode={mapMode}

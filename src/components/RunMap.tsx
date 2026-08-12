@@ -18,6 +18,8 @@ setWorkerUrl(workerUrl)
 type Props = {
   start: LatLng | null
   route: LatLng[] | null
+  /** Other auto-route options shown faintly behind the selected route. */
+  alternateRoutes?: LatLng[][] | null
   controlPoints?: LatLng[] | null
   waypoints?: LatLng[] | null
   mode?: 'pick-start' | 'draw' | 'view'
@@ -28,10 +30,13 @@ type Props = {
 
 const ROUTE_SOURCE = 'run-route'
 const ROUTE_LAYER = 'run-route-line'
+const ALT_SOURCE = 'run-route-alts'
+const ALT_LAYER = 'run-route-alts-line'
 
 export function RunMap({
   start,
   route,
+  alternateRoutes,
   controlPoints,
   waypoints,
   mode = 'pick-start',
@@ -75,6 +80,25 @@ export function RunMap({
     })
 
     map.on('load', () => {
+      map.addSource(ALT_SOURCE, {
+        type: 'geojson',
+        data: emptyMultiLine(),
+      })
+      map.addLayer({
+        id: ALT_LAYER,
+        type: 'line',
+        source: ALT_SOURCE,
+        layout: {
+          'line-cap': 'round',
+          'line-join': 'round',
+        },
+        paint: {
+          'line-color': '#5f7a68',
+          'line-width': 3.5,
+          'line-opacity': 0.35,
+          'line-dasharray': [1.2, 1.6],
+        },
+      })
       map.addSource(ROUTE_SOURCE, {
         type: 'geojson',
         data: emptyLine(),
@@ -93,10 +117,26 @@ export function RunMap({
           'line-opacity': 0.92,
         },
       })
+      map.resize()
     })
+
+    const resizeMap = () => map.resize()
+    window.addEventListener('resize', resizeMap)
+    window.addEventListener('orientationchange', resizeMap)
+
+    const ro =
+      typeof ResizeObserver !== 'undefined'
+        ? new ResizeObserver(() => {
+            map.resize()
+          })
+        : null
+    ro?.observe(containerRef.current)
 
     mapRef.current = map
     return () => {
+      window.removeEventListener('resize', resizeMap)
+      window.removeEventListener('orientationchange', resizeMap)
+      ro?.disconnect()
       markerRef.current?.remove()
       for (const m of handleMarkersRef.current) m.remove()
       for (const m of waypointMarkersRef.current) m.remove()
@@ -151,13 +191,42 @@ export function RunMap({
       if (modeRef.current !== 'draw') {
         const bounds = new LngLatBounds()
         for (const p of route) bounds.extend([p.lng, p.lat])
-        map.fitBounds(bounds, { padding: 64, duration: 800, maxZoom: 15 })
+        const pad = window.matchMedia('(max-width: 860px)').matches ? 36 : 64
+        map.fitBounds(bounds, { padding: pad, duration: 800, maxZoom: 15 })
       }
     }
 
     if (map.isStyleLoaded()) apply()
     else map.once('load', apply)
   }, [route])
+
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+
+    const apply = () => {
+      const source = map.getSource(ALT_SOURCE) as GeoJSONSource | undefined
+      if (!source) return
+
+      const lines = (alternateRoutes ?? []).filter((r) => r.length > 1)
+      if (!lines.length) {
+        source.setData(emptyMultiLine())
+        return
+      }
+
+      source.setData({
+        type: 'Feature',
+        properties: {},
+        geometry: {
+          type: 'MultiLineString',
+          coordinates: lines.map((line) => line.map((p) => [p.lng, p.lat])),
+        },
+      })
+    }
+
+    if (map.isStyleLoaded()) apply()
+    else map.once('load', apply)
+  }, [alternateRoutes])
 
   useEffect(() => {
     const map = mapRef.current
@@ -214,5 +283,13 @@ function emptyLine(): Feature {
     type: 'Feature',
     properties: {},
     geometry: { type: 'LineString', coordinates: [] },
+  }
+}
+
+function emptyMultiLine(): Feature {
+  return {
+    type: 'Feature',
+    properties: {},
+    geometry: { type: 'MultiLineString', coordinates: [] },
   }
 }

@@ -60,6 +60,11 @@ export type RouteResult = {
   waypoints?: LatLng[]
 }
 
+export type PlanRunResult = {
+  routes: RouteResult[]
+  selectedIndex: number
+}
+
 type RouteKind = 'loop' | 'out-and-back' | 'edited' | 'manual'
 
 type RouteCandidate = {
@@ -71,6 +76,23 @@ type RouteCandidate = {
   signals: number
   crossings: number
   turns: number
+}
+
+type RankedCandidate = {
+  candidate: RouteCandidate
+  score: number
+}
+
+type PlannedOption = {
+  candidate: RouteCandidate
+  result: RouteResult
+  controlIndexes: number[]
+}
+
+type PlannedBundle = {
+  graph: RunGraph
+  start: LatLng
+  options: PlannedOption[]
 }
 
 type DijkstraFn = (
@@ -101,6 +123,7 @@ type ManualDrawState = {
 
 let activeSession: RouteSession | null = null
 let manualDraw: ManualDrawState | null = null
+let plannedBundle: PlannedBundle | null = null
 
 export function getActiveSession(): RouteSession | null {
   return activeSession
@@ -108,6 +131,26 @@ export function getActiveSession(): RouteSession | null {
 
 export function isManualDrawing(): boolean {
   return manualDraw !== null
+}
+
+export function clearPlannedRoutes(): void {
+  plannedBundle = null
+}
+
+/** Switch the active auto-route option (updates edit session). */
+export function selectPlannedRoute(index: number): RouteResult {
+  if (!plannedBundle || index < 0 || index >= plannedBundle.options.length) {
+    throw new Error('That route option is no longer available.')
+  }
+  const opt = plannedBundle.options[index]
+  activeSession = {
+    graph: plannedBundle.graph,
+    nodePath: opt.candidate.path,
+    kind: opt.candidate.kind,
+    controlIndexes: opt.controlIndexes,
+    start: plannedBundle.start,
+  }
+  return opt.result
 }
 
 function densify(points: LatLng[], maxStepM = 40): LatLng[] {
@@ -370,24 +413,84 @@ function buildControlIndexes(graph: RunGraph, path: number[], spacingM = 480): n
   return indexes
 }
 
-function controlPointsFromSession(session: RouteSession): LatLng[] {
+function controlPointsFromIndexes(
+  graph: RunGraph,
+  nodePath: number[],
+  controlIndexes: number[],
+): LatLng[] {
   const points: LatLng[] = []
-  // Skip first/last — those stay fixed at the start
-  for (let i = 1; i < session.controlIndexes.length - 1; i++) {
-    const nodeId = session.nodePath[session.controlIndexes[i]]
-    const pos = session.graph.nodePos.get(nodeId)
+  for (let i = 1; i < controlIndexes.length - 1; i++) {
+    const nodeId = nodePath[controlIndexes[i]]
+    const pos = graph.nodePos.get(nodeId)
     if (pos) points.push(pos)
   }
   return points
 }
 
-async function finalizeRoute(
+function routeLabel(kind: RouteKind): string {
+  if (kind === 'out-and-back') return 'Out and back'
+  if (kind === 'edited') return 'Edited route'
+  if (kind === 'manual') return 'Manual route'
+  return 'Loop'
+}
+
+function edgeOverlapRatio(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 && b.size === 0) return 1
+  let inter = 0
+  for (const key of a) {
+    if (b.has(key)) inter += 1
+  }
+  const union = a.size + b.size - inter
+  return union === 0 ? 1 : inter / union
+}
+
+function pathFingerprint(path: number[]): string {
+  if (path.length <= 24) return path.join(',')
+  const step = Math.max(1, Math.floor(path.length / 20))
+  const sample: number[] = []
+  for (let i = 0; i < path.length; i += step) sample.push(path[i])
+  sample.push(path[path.length - 1])
+  return `${path.length}:${sample.join(',')}`
+}
+
+function pickDiverseCandidates(
+  ranked: RankedCandidate[],
+  count: number,
+  minDistanceMiles: number,
+): RouteCandidate[] {
+  const sorted = [...ranked].sort((a, b) => b.score - a.score)
+  const picked: { candidate: RouteCandidate; edges: Set<string> }[] = []
+
+  const tryPick = (maxOverlap: number, requireDistance: boolean) => {
+    for (const entry of sorted) {
+      if (picked.length >= count) return
+      if (
+        requireDistance &&
+        displayMiles(entry.candidate.lengthM) < minDistanceMiles
+      ) {
+        continue
+      }
+      const edges = collectEdgeKeys(entry.candidate.path)
+      if (picked.some((p) => edgeOverlapRatio(p.edges, edges) > maxOverlap)) {
+        continue
+      }
+      picked.push({ candidate: entry.candidate, edges })
+    }
+  }
+
+  tryPick(0.45, true)
+  if (picked.length < count) tryPick(0.65, true)
+  if (picked.length < count) tryPick(0.8, false)
+
+  return picked.map((p) => p.candidate)
+}
+
+async function buildRouteResult(
   graph: RunGraph,
   candidate: RouteCandidate,
-  start: LatLng,
   minDistanceMiles: number,
   options?: { waypoints?: LatLng[] },
-): Promise<RouteResult> {
+): Promise<{ result: RouteResult; controlIndexes: number[] }> {
   let coordinates = pathToLatLng(graph, candidate.path)
   // Only force-close auto loops that didn't quite snap back
   if (
@@ -422,24 +525,7 @@ async function finalizeRoute(
   }
 
   const controlIndexes = buildControlIndexes(graph, candidate.path)
-  activeSession = {
-    graph,
-    nodePath: candidate.path,
-    kind: candidate.kind,
-    controlIndexes,
-    start,
-  }
-
-  const label =
-    candidate.kind === 'out-and-back'
-      ? 'Out and back'
-      : candidate.kind === 'edited'
-        ? 'Edited route'
-        : candidate.kind === 'manual'
-          ? 'Manual route'
-          : 'Loop'
-
-  return {
+  const result: RouteResult = {
     coordinates: dense,
     elevationsM,
     distanceMiles,
@@ -450,18 +536,50 @@ async function finalizeRoute(
     signals: candidate.signals,
     crossings: candidate.crossings,
     turns: candidate.turns,
-    label,
-    controlPoints: controlPointsFromSession(activeSession),
+    label: routeLabel(candidate.kind),
+    controlPoints: controlPointsFromIndexes(
+      graph,
+      candidate.path,
+      controlIndexes,
+    ),
     waypoints: options?.waypoints,
   }
+
+  return { result, controlIndexes }
 }
 
-export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
+async function finalizeRoute(
+  graph: RunGraph,
+  candidate: RouteCandidate,
+  start: LatLng,
+  minDistanceMiles: number,
+  options?: { waypoints?: LatLng[] },
+): Promise<RouteResult> {
+  plannedBundle = null
+  const built = await buildRouteResult(
+    graph,
+    candidate,
+    minDistanceMiles,
+    options,
+  )
+  activeSession = {
+    graph,
+    nodePath: candidate.path,
+    kind: candidate.kind,
+    controlIndexes: built.controlIndexes,
+    start,
+  }
+  return built.result
+}
+
+export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
   const status = req.onStatus ?? (() => {})
   manualDraw = null
+  plannedBundle = null
   const minM = milesToMeters(req.distanceMiles)
   const maxM = milesToMeters(req.distanceMiles + req.varianceMiles)
   const maxClimbM = req.maxClimbFeet / 3.28084
+  const optionCount = 3
 
   const radiusM = Math.min(5000, Math.max(1100, minM * 0.7))
 
@@ -481,7 +599,7 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
     throw new Error('Could not snap the start point to a walkable road.')
   }
 
-  status('Searching for a quiet route…')
+  status('Searching for quiet route options…')
 
   const outAndBackRadii = [minM * 0.45, minM * 0.5, minM * 0.55]
   const loopRadii = [minM * 0.42, minM * 0.5, maxM / (2 * Math.PI) * 1.2]
@@ -494,11 +612,19 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
     { ...DEFAULT_WEIGHTS, signalPenalty: 1600, crossingPenalty: 20, turnPenalty: 140 },
   ]
 
+  const ranked: RankedCandidate[] = []
+  const bestByFingerprint = new Map<string, number>()
   const search = {
     best: null as RouteCandidate | null,
     bestScore: -Infinity,
     closest: null as RouteCandidate | null,
     closestGap: Infinity,
+  }
+
+  const trimRanked = () => {
+    if (ranked.length <= 60) return
+    ranked.sort((a, b) => b.score - a.score)
+    ranked.length = 45
   }
 
   const consider = (
@@ -521,11 +647,22 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
       scoreMaxM,
       scoreClimb,
     )
+    const fingerprint = pathFingerprint(candidate.path)
+    const prev = bestByFingerprint.get(fingerprint)
+    if (prev !== undefined && prev >= s) return
+    bestByFingerprint.set(fingerprint, s)
+    ranked.push({ candidate, score: s })
+    if (ranked.length % 25 === 0) trimRanked()
+
     if (s > search.bestScore) {
       search.bestScore = s
       search.best = candidate
     }
   }
+
+  const hasEnoughOptions = () =>
+    pickDiverseCandidates(ranked, optionCount, req.distanceMiles).length >=
+    optionCount
 
   let attempts = 0
 
@@ -553,6 +690,7 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
       }
     }
     if (
+      hasEnoughOptions() &&
       search.best &&
       search.best.kind === 'loop' &&
       displayMiles(search.best.lengthM) >= req.distanceMiles &&
@@ -563,8 +701,9 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
     }
   }
 
-  // Pass 2: same-path out-and-back only if no good loop landed in range
+  // Pass 2: same-path out-and-back only if not enough good options
   if (
+    !hasEnoughOptions() ||
     !search.best ||
     search.best.kind !== 'loop' ||
     displayMiles(search.best.lengthM) < req.distanceMiles ||
@@ -584,6 +723,7 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
         }
       }
       if (
+        hasEnoughOptions() &&
         search.best &&
         displayMiles(search.best.lengthM) >= req.distanceMiles &&
         search.best.lengthM <= maxM &&
@@ -621,7 +761,11 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
     }
   }
 
-  const best = search.best ?? search.closest
+  let selected = pickDiverseCandidates(ranked, optionCount, req.distanceMiles)
+  if (selected.length === 0 && search.best) selected = [search.best]
+  if (selected.length === 0 && search.closest) selected = [search.closest]
+
+  const best = selected[0] ?? null
 
   if (!best || best.path.length < 3) {
     throw new Error(
@@ -635,8 +779,51 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
     )
   }
 
-  status('Building map & elevation profile…')
-  return finalizeRoute(graph, best, req.start, req.distanceMiles)
+  // Keep only options that meet the distance floor
+  selected = selected.filter(
+    (c) => displayMiles(c.lengthM) >= req.distanceMiles,
+  )
+  if (selected.length === 0) selected = [best]
+
+  status(
+    selected.length > 1
+      ? `Building ${selected.length} route options…`
+      : 'Building map & elevation profile…',
+  )
+
+  const options: PlannedOption[] = []
+  for (const candidate of selected) {
+    try {
+      const built = await buildRouteResult(graph, candidate, req.distanceMiles)
+      options.push({
+        candidate,
+        result: built.result,
+        controlIndexes: built.controlIndexes,
+      })
+    } catch {
+      // Skip a candidate that failed densify/elev validation
+    }
+  }
+
+  if (options.length === 0) {
+    throw new Error(
+      'Could not finalize a route with those constraints. Try a larger variance.',
+    )
+  }
+
+  plannedBundle = { graph, start: req.start, options }
+  activeSession = {
+    graph,
+    nodePath: options[0].candidate.path,
+    kind: options[0].candidate.kind,
+    controlIndexes: options[0].controlIndexes,
+    start: req.start,
+  }
+
+  return {
+    routes: options.map((o) => o.result),
+    selectedIndex: 0,
+  }
 }
 
 /**
@@ -767,6 +954,8 @@ export async function beginManualRoute(
   onStatus?: (message: string) => void,
 ): Promise<void> {
   const status = onStatus ?? (() => {})
+  plannedBundle = null
+  activeSession = null
   const radiusM = Math.min(
     6000,
     Math.max(1500, milesToMeters(distanceHintMiles) * 0.75),
@@ -885,4 +1074,5 @@ export async function finishManualAtStart(): Promise<RouteResult> {
 
 export function cancelManualRoute(): void {
   manualDraw = null
+  plannedBundle = null
 }
