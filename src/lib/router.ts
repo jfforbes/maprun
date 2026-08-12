@@ -20,6 +20,7 @@ import {
   DEFAULT_WEIGHTS,
   nearestGraphNodeId,
   pathToLatLng,
+  SHORTEST_WEIGHTS,
   type DijkstraResult,
   type PathCostWeights,
   type RunGraph,
@@ -665,8 +666,8 @@ export async function dragRouteHandle(
   }
 
   const findPath = createDijkstraCache()
-  const leg1 = findPath(session.graph, prevNode, snapped, DEFAULT_WEIGHTS)
-  const leg2 = findPath(session.graph, snapped, nextNode, DEFAULT_WEIGHTS)
+  const leg1 = findPath(session.graph, prevNode, snapped, SHORTEST_WEIGHTS)
+  const leg2 = findPath(session.graph, snapped, nextNode, SHORTEST_WEIGHTS)
   if (!leg1 || !leg2) {
     throw new Error('Could not re-route through that point.')
   }
@@ -812,7 +813,7 @@ export async function addManualWaypoint(point: LatLng): Promise<RouteResult> {
   }
 
   const findPath = createDijkstraCache()
-  const leg = findPath(manualDraw.graph, fromId, snapped, DEFAULT_WEIGHTS)
+  const leg = findPath(manualDraw.graph, fromId, snapped, SHORTEST_WEIGHTS)
   if (!leg || leg.path.length < 2) {
     throw new Error('Could not route to that point on the street network.')
   }
@@ -839,7 +840,7 @@ export async function undoManualWaypoint(): Promise<RouteResult | null> {
       manualDraw.graph,
       manualDraw.waypointIds[i - 1],
       manualDraw.waypointIds[i],
-      DEFAULT_WEIGHTS,
+      SHORTEST_WEIGHTS,
     )
     if (!leg) throw new Error('Could not rebuild the route after undo.')
     path = mergePaths([path, leg.path])
@@ -867,7 +868,7 @@ export async function finishManualAtStart(): Promise<RouteResult> {
     manualDraw.graph,
     fromId,
     manualDraw.startId,
-    DEFAULT_WEIGHTS,
+    SHORTEST_WEIGHTS,
   )
   if (!leg || leg.path.length < 2) {
     throw new Error('Could not route back to the start.')

@@ -116,6 +116,8 @@ export type PathCostWeights = {
   signalPenalty: number
   crossingPenalty: number
   elevGainPenalty: number
+  /** When true, ignore footway-vs-road preference and route by length. */
+  shortestPath?: boolean
 }
 
 export const DEFAULT_WEIGHTS: PathCostWeights = {
@@ -124,6 +126,15 @@ export const DEFAULT_WEIGHTS: PathCostWeights = {
   signalPenalty: 1000,
   crossingPenalty: 120,
   elevGainPenalty: 8,
+}
+
+/** Direct street distance between clicks — used for manual drawing. */
+export const SHORTEST_WEIGHTS: PathCostWeights = {
+  turnPenalty: 0,
+  signalPenalty: 0,
+  crossingPenalty: 0,
+  elevGainPenalty: 0,
+  shortestPath: true,
 }
 
 export type DijkstraResult = {
@@ -260,7 +271,9 @@ export function dijkstra(
       const ek = edgeKey(cur.id, edge.to)
       if (avoidEdgeKeys?.has(ek)) continue
 
-      const highwayMul = FOOT_PREF[edge.highway] ?? 1.2
+      const highwayMul = weights.shortestPath
+        ? 1
+        : (FOOT_PREF[edge.highway] ?? 1.2)
       let turn = 0
       let turnCount = 0
       if (cur.bearing !== null) {
@@ -268,12 +281,13 @@ export function dijkstra(
         if (turn > 25) turnCount = 1
       }
 
-      const stepCost =
-        edge.lengthM * highwayMul +
-        (turn / 45) * weights.turnPenalty +
-        (edge.entersSignal ? weights.signalPenalty : 0) +
-        (edge.entersCrossing ? weights.crossingPenalty : 0) +
-        edge.elevGainM * weights.elevGainPenalty
+      const stepCost = weights.shortestPath
+        ? edge.lengthM
+        : edge.lengthM * highwayMul +
+          (turn / 45) * weights.turnPenalty +
+          (edge.entersSignal ? weights.signalPenalty : 0) +
+          (edge.entersCrossing ? weights.crossingPenalty : 0) +
+          edge.elevGainM * weights.elevGainPenalty
 
       const nextCost = cur.cost + stepCost
       if (nextCost + 1e-6 >= (best.get(edge.to) ?? Infinity)) continue
@@ -328,6 +342,7 @@ function weightsKey(weights: PathCostWeights): string {
     weights.signalPenalty,
     weights.crossingPenalty,
     weights.elevGainPenalty,
+    weights.shortestPath ? 1 : 0,
   ].join(',')
 }
 
