@@ -18,18 +18,33 @@ setWorkerUrl(workerUrl)
 type Props = {
   start: LatLng | null
   route: LatLng[] | null
+  controlPoints?: LatLng[] | null
+  allowPickStart?: boolean
   onPickStart?: (point: LatLng) => void
+  onDragHandle?: (handleIndex: number, point: LatLng) => void
 }
 
 const ROUTE_SOURCE = 'run-route'
 const ROUTE_LAYER = 'run-route-line'
 
-export function RunMap({ start, route, onPickStart }: Props) {
+export function RunMap({
+  start,
+  route,
+  controlPoints,
+  allowPickStart = true,
+  onPickStart,
+  onDragHandle,
+}: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<Map | null>(null)
   const markerRef = useRef<Marker | null>(null)
+  const handleMarkersRef = useRef<Marker[]>([])
   const onPickRef = useRef(onPickStart)
+  const onDragRef = useRef(onDragHandle)
+  const allowPickRef = useRef(allowPickStart)
   onPickRef.current = onPickStart
+  onDragRef.current = onDragHandle
+  allowPickRef.current = allowPickStart
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return
@@ -44,6 +59,7 @@ export function RunMap({ start, route, onPickStart }: Props) {
     map.addControl(new NavigationControl({ showCompass: false }), 'top-right')
 
     map.on('click', (e: MapMouseEvent) => {
+      if (!allowPickRef.current) return
       onPickRef.current?.({ lat: e.lngLat.lat, lng: e.lngLat.lng })
     })
 
@@ -71,6 +87,8 @@ export function RunMap({ start, route, onPickStart }: Props) {
     mapRef.current = map
     return () => {
       markerRef.current?.remove()
+      for (const m of handleMarkersRef.current) m.remove()
+      handleMarkersRef.current = []
       map.remove()
       mapRef.current = null
     }
@@ -125,6 +143,32 @@ export function RunMap({ start, route, onPickStart }: Props) {
     if (map.isStyleLoaded()) apply()
     else map.once('load', apply)
   }, [route])
+
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+
+    for (const m of handleMarkersRef.current) m.remove()
+    handleMarkersRef.current = []
+
+    if (!controlPoints?.length) return
+
+    controlPoints.forEach((point, index) => {
+      const el = document.createElement('div')
+      el.className = 'route-handle'
+      el.title = 'Drag to reshape the route'
+      const marker = new Marker({ element: el, draggable: true })
+        .setLngLat([point.lng, point.lat])
+        .addTo(map)
+
+      marker.on('dragend', () => {
+        const lngLat = marker.getLngLat()
+        onDragRef.current?.(index, { lat: lngLat.lat, lng: lngLat.lng })
+      })
+
+      handleMarkersRef.current.push(marker)
+    })
+  }, [controlPoints])
 
   return <div ref={containerRef} className="run-map" role="presentation" />
 }

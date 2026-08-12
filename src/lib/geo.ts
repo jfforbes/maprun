@@ -91,6 +91,20 @@ export function elevationGainFeet(elevationsM: number[]): number {
   return gain * 3.28084
 }
 
+export function elevationLossFeet(elevationsM: number[]): number {
+  let loss = 0
+  for (let i = 1; i < elevationsM.length; i++) {
+    const d = elevationsM[i - 1] - elevationsM[i]
+    if (d > 0.5) loss += d
+  }
+  return loss * 3.28084
+}
+
+/** Total up + down movement along the route */
+export function elevationChangeFeet(elevationsM: number[]): number {
+  return elevationGainFeet(elevationsM) + elevationLossFeet(elevationsM)
+}
+
 export function metersToFeet(m: number): number {
   return m * 3.28084
 }

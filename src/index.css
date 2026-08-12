@@ -292,6 +292,21 @@ input {
   box-shadow: 0 6px 16px rgba(20, 32, 24, 0.35);
 }
 
+.route-handle {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #1f6f4a;
+  border: 3px solid #f4faf6;
+  box-shadow: 0 4px 12px rgba(20, 32, 24, 0.35);
+  cursor: grab;
+}
+
+.route-handle:active {
+  cursor: grabbing;
+  transform: scale(1.15);
+}
+
 .maplibregl-ctrl-group {
   border-radius: 12px !important;
   overflow: hidden;

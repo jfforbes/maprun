@@ -4,7 +4,11 @@ import { RunMap } from './components/RunMap'
 import { geocodeAddress, type GeocodeResult } from './lib/geocode'
 import { buildGpx, downloadGpx } from './lib/gpx'
 import type { LatLng } from './lib/geo'
-import { planRunRoute, type RouteResult } from './lib/router'
+import {
+  dragRouteHandle,
+  planRunRoute,
+  type RouteResult,
+} from './lib/router'
 
 type FormState = {
   location: string
@@ -37,7 +41,9 @@ export default function App() {
     return [
       { label: 'Type', value: route.label },
       { label: 'Distance', value: `${route.distanceMiles.toFixed(2)} mi` },
+      { label: 'Elev change', value: `${Math.round(route.elevationChangeFeet)} ft` },
       { label: 'Elev gain', value: `${Math.round(route.elevationGainFeet)} ft` },
+      { label: 'Elev loss', value: `${Math.round(route.elevationLossFeet)} ft` },
       { label: 'Elev range', value: `${Math.round(route.elevationRangeFeet)} ft` },
       { label: 'Signals', value: String(route.signals) },
       { label: 'Crossings', value: String(route.crossings) },
@@ -60,6 +66,22 @@ export default function App() {
     setForm((f) => ({ ...f, location: label }))
     setPickedFromSuggestions(true)
     setRoute(null)
+  }
+
+  async function onDragHandle(handleIndex: number, point: LatLng) {
+    setError(null)
+    setBusy(true)
+    setStatus('Updating route…')
+    try {
+      const result = await dragRouteHandle(handleIndex, point)
+      setRoute(result)
+      setStatus(null)
+    } catch (err) {
+      setStatus(null)
+      setError(err instanceof Error ? err.message : 'Could not update route.')
+    } finally {
+      setBusy(false)
+    }
   }
 
   async function onSubmit(e: FormEvent) {
@@ -195,8 +217,9 @@ export default function App() {
               }
             />
             <em className="field-hint">
-              Caps cumulative climb. Builds a loop or out-and-back. Distance stays
-              at or above target, up to target + variance.
+              Caps total up + down (gain and loss combined). Prefers out-and-back
+              on the same path, or a loop. Drag green handles on the map to
+              reshape.
             </em>
           </label>
 
@@ -240,7 +263,10 @@ export default function App() {
         <RunMap
           start={start}
           route={route?.coordinates ?? null}
+          controlPoints={route?.controlPoints ?? null}
+          allowPickStart={!route}
           onPickStart={onPickStart}
+          onDragHandle={onDragHandle}
         />
       </main>
     </div>

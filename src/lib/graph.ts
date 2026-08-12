@@ -123,6 +123,7 @@ export type DijkstraResult = {
   path: number[]
   lengthM: number
   elevGainM: number
+  elevLossM: number
   signals: number
   crossings: number
   turns: number
@@ -195,6 +196,7 @@ export function dijkstra(
       path: [startId],
       lengthM: 0,
       elevGainM: 0,
+      elevLossM: 0,
       signals: 0,
       crossings: 0,
       turns: 0,
@@ -206,13 +208,13 @@ export function dijkstra(
     cost: number
     lengthM: number
     elevGainM: number
+    elevLossM: number
     signals: number
     crossings: number
     turns: number
     bearing: number | null
   }
 
-  // Collapse bearing into the search key only loosely — prefer node-level best for speed
   const best = new Map<number, number>()
   const prev = new Map<number, number | null>()
   const meta = new Map<number, Omit<State, 'id' | 'cost'>>()
@@ -223,6 +225,7 @@ export function dijkstra(
     cost: 0,
     lengthM: 0,
     elevGainM: 0,
+    elevLossM: 0,
     signals: 0,
     crossings: 0,
     turns: 0,
@@ -233,6 +236,7 @@ export function dijkstra(
   meta.set(startId, {
     lengthM: 0,
     elevGainM: 0,
+    elevLossM: 0,
     signals: 0,
     crossings: 0,
     turns: 0,
@@ -267,25 +271,23 @@ export function dijkstra(
       const nextCost = cur.cost + stepCost
       if (nextCost + 1e-6 >= (best.get(edge.to) ?? Infinity)) continue
 
-      best.set(edge.to, nextCost)
-      prev.set(edge.to, cur.id)
-      meta.set(edge.to, {
+      const nextMeta = {
         lengthM: cur.lengthM + edge.lengthM,
         elevGainM: cur.elevGainM + edge.elevGainM,
+        elevLossM: cur.elevLossM + edge.elevLossM,
         signals: cur.signals + (edge.hasSignal ? 1 : 0),
         crossings: cur.crossings + (edge.hasCrossing ? 1 : 0),
         turns: cur.turns + turnCount,
         bearing: edge.bearing,
-      })
+      }
+
+      best.set(edge.to, nextCost)
+      prev.set(edge.to, cur.id)
+      meta.set(edge.to, nextMeta)
       heap.push({
         id: edge.to,
         cost: nextCost,
-        lengthM: cur.lengthM + edge.lengthM,
-        elevGainM: cur.elevGainM + edge.elevGainM,
-        signals: cur.signals + (edge.hasSignal ? 1 : 0),
-        crossings: cur.crossings + (edge.hasCrossing ? 1 : 0),
-        turns: cur.turns + turnCount,
-        bearing: edge.bearing,
+        ...nextMeta,
       })
     }
   }
@@ -306,9 +308,42 @@ export function dijkstra(
     path,
     lengthM: endMeta.lengthM,
     elevGainM: endMeta.elevGainM,
+    elevLossM: endMeta.elevLossM,
     signals: endMeta.signals,
     crossings: endMeta.crossings,
     turns: endMeta.turns,
+  }
+}
+
+function weightsKey(weights: PathCostWeights): string {
+  return [
+    weights.turnPenalty,
+    weights.signalPenalty,
+    weights.crossingPenalty,
+    weights.elevGainPenalty,
+  ].join(',')
+}
+
+/** Cache plain A→B searches (no avoid-set). Huge win during multi-bearing search. */
+export function createDijkstraCache() {
+  const cache = new Map<string, DijkstraResult | null>()
+
+  return function cachedDijkstra(
+    graph: RunGraph,
+    startId: number,
+    endId: number,
+    weights: PathCostWeights = DEFAULT_WEIGHTS,
+    avoidEdgeKeys?: Set<string>,
+  ): DijkstraResult | null {
+    const canCache = !avoidEdgeKeys || avoidEdgeKeys.size === 0
+    const key = canCache
+      ? `${startId}>${endId}|${weightsKey(weights)}`
+      : null
+    if (key && cache.has(key)) return cache.get(key) ?? null
+
+    const result = dijkstra(graph, startId, endId, weights, avoidEdgeKeys)
+    if (key) cache.set(key, result)
+    return result
   }
 }
 
@@ -320,6 +355,24 @@ export function pathToLatLng(graph: RunGraph, path: number[]): LatLng[] {
   return path
     .map((id) => graph.nodePos.get(id))
     .filter((p): p is LatLng => Boolean(p))
+}
+
+export function nearestGraphNodeId(
+  graph: RunGraph,
+  point: LatLng,
+  maxM = 250,
+): number | null {
+  let bestId: number | null = null
+  let bestDist = Infinity
+  for (const [id, pos] of graph.nodePos) {
+    const d = haversineMeters(point, pos)
+    if (d < bestDist) {
+      bestDist = d
+      bestId = id
+    }
+  }
+  if (bestId === null || bestDist > maxM) return null
+  return bestId
 }
 
 /** Soften repeated edge use when stitching loop legs */

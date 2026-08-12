@@ -2,18 +2,22 @@ import { fetchElevationsSoft } from './elevation'
 import {
   destinationPoint,
   displayMiles,
+  elevationChangeFeet,
   elevationGainFeet,
+  elevationLossFeet,
   haversineMeters,
   metersToFeet,
   milesToMeters,
   pathLengthMeters,
+  turnAngleDegrees,
   type LatLng,
 } from './geo'
 import {
   buildGraph,
   collectEdgeKeys,
+  createDijkstraCache,
   DEFAULT_WEIGHTS,
-  dijkstra,
+  nearestGraphNodeId,
   pathToLatLng,
   type DijkstraResult,
   type PathCostWeights,
@@ -39,11 +43,51 @@ export type RouteResult = {
   elevationsM: number[]
   distanceMiles: number
   elevationGainFeet: number
+  elevationLossFeet: number
+  elevationChangeFeet: number
   elevationRangeFeet: number
   signals: number
   crossings: number
   turns: number
   label: string
+  /** Mid-route handles the user can drag (excludes fixed start/end). */
+  controlPoints: LatLng[]
+}
+
+type RouteKind = 'loop' | 'out-and-back' | 'edited'
+
+type RouteCandidate = {
+  kind: RouteKind
+  path: number[]
+  lengthM: number
+  elevGainM: number
+  elevLossM: number
+  signals: number
+  crossings: number
+  turns: number
+}
+
+type DijkstraFn = (
+  graph: RunGraph,
+  startId: number,
+  endId: number,
+  weights?: PathCostWeights,
+  avoidEdgeKeys?: Set<string>,
+) => DijkstraResult | null
+
+export type RouteSession = {
+  graph: RunGraph
+  nodePath: number[]
+  kind: RouteKind
+  /** Indexes into nodePath for all handles, including start/end. */
+  controlIndexes: number[]
+  start: LatLng
+}
+
+let activeSession: RouteSession | null = null
+
+export function getActiveSession(): RouteSession | null {
+  return activeSession
 }
 
 function densify(points: LatLng[], maxStepM = 40): LatLng[] {
@@ -83,19 +127,19 @@ function scoreRoute(
   stats: {
     lengthM: number
     elevGainM: number
+    elevLossM: number
     signals: number
     crossings: number
     turns: number
   },
   minM: number,
   maxM: number,
-  maxElevGainM: number,
+  maxElevChangeM: number,
 ): number {
-  // Soft preference: never reward under-distance, but keep a finite score so
-  // the search can still track the closest attempt.
   const under = Math.max(0, minM - stats.lengthM)
   const over = Math.max(0, stats.lengthM - maxM)
-  const elevOver = Math.max(0, stats.elevGainM - maxElevGainM)
+  const elevChange = stats.elevGainM + stats.elevLossM
+  const elevOver = Math.max(0, elevChange - maxElevChangeM)
 
   const lengthTarget = minM + Math.min(maxM - minM, minM * 0.08) * 0.5
   const lengthScore = -Math.abs(stats.lengthM - lengthTarget) / 40
@@ -120,22 +164,11 @@ function summarizePath(
     path: mergePaths(parts.map((p) => p.path)),
     lengthM: parts.reduce((s, p) => s + p.lengthM, 0),
     elevGainM: parts.reduce((s, p) => s + p.elevGainM, 0),
+    elevLossM: parts.reduce((s, p) => s + p.elevLossM, 0),
     signals: parts.reduce((s, p) => s + p.signals, 0),
     crossings: parts.reduce((s, p) => s + p.crossings, 0),
     turns: parts.reduce((s, p) => s + p.turns, 0),
   }
-}
-
-type RouteKind = 'loop' | 'out-and-back'
-
-type RouteCandidate = {
-  kind: RouteKind
-  path: number[]
-  lengthM: number
-  elevGainM: number
-  signals: number
-  crossings: number
-  turns: number
 }
 
 function findNearbyNodes(
@@ -152,34 +185,43 @@ function findNearbyNodes(
   return scored.slice(0, limit).map((s) => s.id)
 }
 
-function elevGainAlongPath(graph: RunGraph, path: number[]): number {
+function elevAlongPath(
+  graph: RunGraph,
+  path: number[],
+): { gain: number; loss: number } {
   let gain = 0
+  let loss = 0
   for (let i = 0; i < path.length - 1; i++) {
     const edge = (graph.adj.get(path[i]) ?? []).find((e) => e.to === path[i + 1])
-    if (edge) gain += edge.elevGainM
+    if (edge) {
+      gain += edge.elevGainM
+      loss += edge.elevLossM
+    }
   }
-  return gain
+  return { gain, loss }
 }
 
-/** Same path out and back — classic turnaround run */
+/** Same path out and back — reverse the outbound polyline exactly */
 function tryOutAndBack(
   graph: RunGraph,
   startId: number,
   farId: number,
   weights: PathCostWeights,
+  findPath: DijkstraFn,
 ): RouteCandidate | null {
-  const out = dijkstra(graph, startId, farId, weights)
+  const out = findPath(graph, startId, farId, weights)
   if (!out || out.path.length < 2) return null
 
   const backPath = [...out.path].reverse()
   const path = mergePaths([out.path, backPath])
-  const backGain = elevGainAlongPath(graph, backPath)
+  const back = elevAlongPath(graph, backPath)
 
   return {
     kind: 'out-and-back',
     path,
     lengthM: out.lengthM * 2,
-    elevGainM: out.elevGainM + backGain,
+    elevGainM: out.elevGainM + back.gain,
+    elevLossM: out.elevLossM + back.loss,
     signals: out.signals * 2,
     crossings: out.crossings * 2,
     turns: out.turns * 2 + 1,
@@ -191,15 +233,15 @@ function tryTwoLegLoop(
   startId: number,
   farId: number,
   weights: PathCostWeights,
+  findPath: DijkstraFn,
 ): RouteCandidate | null {
-  const out = dijkstra(graph, startId, farId, weights)
+  const out = findPath(graph, startId, farId, weights)
   if (!out || out.path.length < 2) return null
 
   const avoid = collectEdgeKeys(out.path)
-  const back = dijkstra(graph, farId, startId, weights, avoid)
+  const back = findPath(graph, farId, startId, weights, avoid)
   if (!back || back.path.length < 2) {
-    // No distinct return path — treat as out-and-back instead
-    return tryOutAndBack(graph, startId, farId, weights)
+    return tryOutAndBack(graph, startId, farId, weights, findPath)
   }
   return summarizePath([out, back], 'loop')
 }
@@ -210,16 +252,17 @@ function tryThreeLegLoop(
   aId: number,
   bId: number,
   weights: PathCostWeights,
+  findPath: DijkstraFn,
 ): RouteCandidate | null {
-  const leg1 = dijkstra(graph, startId, aId, weights)
+  const leg1 = findPath(graph, startId, aId, weights)
   if (!leg1) return null
   const avoid1 = collectEdgeKeys(leg1.path)
-  const leg2 = dijkstra(graph, aId, bId, weights, avoid1)
+  const leg2 = findPath(graph, aId, bId, weights, avoid1)
   if (!leg2) return null
   const avoid2 = new Set([...avoid1, ...collectEdgeKeys(leg2.path)])
-  const leg3 = dijkstra(graph, bId, startId, weights, avoid2)
+  const leg3 = findPath(graph, bId, startId, weights, avoid2)
   if (!leg3) {
-    const leg3Any = dijkstra(graph, bId, startId, weights)
+    const leg3Any = findPath(graph, bId, startId, weights)
     if (!leg3Any) return null
     return summarizePath([leg1, leg2, leg3Any], 'loop')
   }
@@ -239,9 +282,8 @@ async function elevationsForNetwork(
     points.push({ lat: n.lat, lng: n.lng })
   }
 
-  // Subsample for very large graphs, then nearest-fill
   const maxSamples = 180
-  let elevMap = new Map<number, number>()
+  const elevMap = new Map<number, number>()
   if (points.length <= maxSamples) {
     const elevs = await fetchElevationsSoft(points)
     ids.forEach((id, i) => elevMap.set(id, elevs[i] ?? 0))
@@ -272,13 +314,110 @@ function yieldToUi(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0))
 }
 
+function buildControlIndexes(graph: RunGraph, path: number[], spacingM = 480): number[] {
+  if (path.length < 2) return path.map((_, i) => i)
+  const indexes = [0]
+  let acc = 0
+  for (let i = 1; i < path.length - 1; i++) {
+    const a = graph.nodePos.get(path[i - 1])
+    const b = graph.nodePos.get(path[i])
+    if (!a || !b) continue
+    acc += haversineMeters(a, b)
+    if (acc >= spacingM) {
+      indexes.push(i)
+      acc = 0
+    }
+  }
+  indexes.push(path.length - 1)
+  return indexes
+}
+
+function controlPointsFromSession(session: RouteSession): LatLng[] {
+  const points: LatLng[] = []
+  // Skip first/last — those stay fixed at the start
+  for (let i = 1; i < session.controlIndexes.length - 1; i++) {
+    const nodeId = session.nodePath[session.controlIndexes[i]]
+    const pos = session.graph.nodePos.get(nodeId)
+    if (pos) points.push(pos)
+  }
+  return points
+}
+
+async function finalizeRoute(
+  graph: RunGraph,
+  candidate: RouteCandidate,
+  start: LatLng,
+  minDistanceMiles: number,
+): Promise<RouteResult> {
+  let coordinates = pathToLatLng(graph, candidate.path)
+  if (
+    coordinates.length &&
+    haversineMeters(coordinates[0], coordinates[coordinates.length - 1]) > 15
+  ) {
+    coordinates = [...coordinates, coordinates[0]]
+  }
+
+  const dense = densify(coordinates, 60)
+  const sampleEvery = Math.max(1, Math.ceil(dense.length / 120))
+  const samplePts = dense.filter(
+    (_, i) => i % sampleEvery === 0 || i === dense.length - 1,
+  )
+  const sampleElevs = await fetchElevationsSoft(samplePts)
+  const elevationsM = dense.map((_, i) => {
+    const idx = Math.min(sampleElevs.length - 1, Math.round(i / sampleEvery))
+    return sampleElevs[idx] ?? 0
+  })
+  const distanceMiles = displayMiles(pathLengthMeters(dense))
+  const elevGain = elevationGainFeet(elevationsM)
+  const elevLoss = elevationLossFeet(elevationsM)
+  const elevChange = elevationChangeFeet(elevationsM)
+  const elevMin = Math.min(...elevationsM)
+  const elevMax = Math.max(...elevationsM)
+
+  if (distanceMiles < minDistanceMiles) {
+    throw new Error(
+      `Routed distance came out under target (${distanceMiles.toFixed(2)} mi). Try increasing variance slightly.`,
+    )
+  }
+
+  const controlIndexes = buildControlIndexes(graph, candidate.path)
+  activeSession = {
+    graph,
+    nodePath: candidate.path,
+    kind: candidate.kind,
+    controlIndexes,
+    start,
+  }
+
+  const label =
+    candidate.kind === 'out-and-back'
+      ? 'Out and back'
+      : candidate.kind === 'edited'
+        ? 'Edited route'
+        : 'Loop'
+
+  return {
+    coordinates: dense,
+    elevationsM,
+    distanceMiles,
+    elevationGainFeet: elevGain,
+    elevationLossFeet: elevLoss,
+    elevationChangeFeet: elevChange,
+    elevationRangeFeet: metersToFeet(elevMax - elevMin),
+    signals: candidate.signals,
+    crossings: candidate.crossings,
+    turns: candidate.turns,
+    label,
+    controlPoints: controlPointsFromSession(activeSession),
+  }
+}
+
 export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
   const status = req.onStatus ?? (() => {})
   const minM = milesToMeters(req.distanceMiles)
   const maxM = milesToMeters(req.distanceMiles + req.varianceMiles)
-  const maxElevGainM = req.maxElevationChangeFeet / 3.28084
+  const maxElevChangeM = req.maxElevationChangeFeet / 3.28084
 
-  // Search radius: enough area for a loop of this length
   const radiusM = Math.min(5000, Math.max(1100, minM * 0.7))
 
   status('Loading streets & paths…')
@@ -290,6 +429,7 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
   status('Reading elevation…')
   const elevByNode = await elevationsForNetwork(network)
   const graph = buildGraph(network, elevByNode)
+  const findPath = createDijkstraCache()
 
   const startId = nearestNodeId(network, req.start, 300)
   if (startId === null || !graph.adj.has(startId)) {
@@ -298,24 +438,15 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
 
   status('Searching for a quiet route…')
 
-  // Out-and-back turnarounds sit near half the target distance;
-  // loops sit nearer circumference/(2π) or similar.
-  const idealLoopRadius = maxM / (2 * Math.PI)
-  const outAndBackRadii = [minM * 0.42, minM * 0.5, minM * 0.58]
-  const loopRadii = [
-    minM * 0.42,
-    minM * 0.5,
-    idealLoopRadius * 1.1,
-    idealLoopRadius * 1.4,
-  ]
+  const outAndBackRadii = [minM * 0.45, minM * 0.5, minM * 0.55]
+  const loopRadii = [minM * 0.42, minM * 0.5, maxM / (2 * Math.PI) * 1.2]
 
   const bearings: number[] = []
-  for (let b = 0; b < 360; b += 24) bearings.push(b)
+  for (let b = 0; b < 360; b += 30) bearings.push(b)
 
   const weightSets: PathCostWeights[] = [
     DEFAULT_WEIGHTS,
     { ...DEFAULT_WEIGHTS, signalPenalty: 260, crossingPenalty: 140, turnPenalty: 35 },
-    { turnPenalty: 12, signalPenalty: 100, crossingPenalty: 50, elevGainPenalty: 3 },
   ]
 
   const search = {
@@ -324,13 +455,11 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
     closest: null as RouteCandidate | null,
     closestGap: Infinity,
   }
-  let attempts = 0
-  const maxAttempts = 140
 
   const consider = (
     candidate: RouteCandidate | null,
     scoreMaxM = maxM,
-    scoreElev = maxElevGainM,
+    scoreElev = maxElevChangeM,
   ) => {
     if (!candidate || candidate.path.length < 3) return
     const gap =
@@ -348,41 +477,20 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
     }
   }
 
+  let attempts = 0
+
+  // Pass 1: same-path out-and-backs only (fast + matches classic turnaround runs)
   for (const weights of weightSets) {
     for (const bearing of bearings) {
-      if (attempts++ > maxAttempts) break
-      if (attempts % 6 === 0) await yieldToUi()
-
-      // Prefer true out-and-backs — same path out, turn around, same path back
+      if (++attempts % 8 === 0) await yieldToUi()
       for (const radius of outAndBackRadii) {
-        const farPoint = destinationPoint(req.start, bearing, radius)
-        for (const farId of findNearbyNodes(graph, farPoint, 4)) {
-          if (farId === startId) continue
-          consider(tryOutAndBack(graph, startId, farId, weights))
-        }
-      }
-
-      // Alternate-return loops (two-leg) and triangle loops
-      for (const radius of loopRadii) {
         const farPoint = destinationPoint(req.start, bearing, radius)
         for (const farId of findNearbyNodes(graph, farPoint, 3)) {
           if (farId === startId) continue
-          consider(tryTwoLegLoop(graph, startId, farId, weights))
-        }
-
-        const aPoint = destinationPoint(req.start, bearing, radius)
-        const bPoint = destinationPoint(req.start, bearing + 100, radius * 0.95)
-        const aIds = findNearbyNodes(graph, aPoint, 2)
-        const bIds = findNearbyNodes(graph, bPoint, 2)
-        for (const aId of aIds) {
-          for (const bId of bIds) {
-            if (aId === startId || bId === startId || aId === bId) continue
-            consider(tryThreeLegLoop(graph, startId, aId, bId, weights))
-          }
+          consider(tryOutAndBack(graph, startId, farId, weights, findPath))
         }
       }
     }
-    if (attempts > maxAttempts) break
     if (
       search.best &&
       displayMiles(search.best.lengthM) >= req.distanceMiles &&
@@ -392,7 +500,45 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
     }
   }
 
-  // Fallback: stretch farther if everything was too short
+  // Pass 2: loops only if out-and-back didn't land in range
+  if (
+    !search.best ||
+    displayMiles(search.best.lengthM) < req.distanceMiles ||
+    search.best.lengthM > maxM
+  ) {
+    status('Trying loop alternatives…')
+    for (const weights of weightSets) {
+      for (const bearing of bearings) {
+        if (++attempts % 6 === 0) await yieldToUi()
+        for (const radius of loopRadii) {
+          const farPoint = destinationPoint(req.start, bearing, radius)
+          for (const farId of findNearbyNodes(graph, farPoint, 2)) {
+            if (farId === startId) continue
+            consider(tryTwoLegLoop(graph, startId, farId, weights, findPath))
+          }
+
+          const aPoint = destinationPoint(req.start, bearing, radius)
+          const bPoint = destinationPoint(req.start, bearing + 100, radius * 0.95)
+          const aIds = findNearbyNodes(graph, aPoint, 2)
+          const bIds = findNearbyNodes(graph, bPoint, 2)
+          for (const aId of aIds) {
+            for (const bId of bIds) {
+              if (aId === startId || bId === startId || aId === bId) continue
+              consider(tryThreeLegLoop(graph, startId, aId, bId, weights, findPath))
+            }
+          }
+        }
+      }
+      if (
+        search.best &&
+        displayMiles(search.best.lengthM) >= req.distanceMiles &&
+        search.best.lengthM <= maxM
+      ) {
+        break
+      }
+    }
+  }
+
   if (!search.best || displayMiles(search.best.lengthM) < req.distanceMiles) {
     status('Stretching the route to meet distance…')
     const softWeights: PathCostWeights = {
@@ -401,19 +547,14 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
       crossingPenalty: 40,
       elevGainPenalty: 2,
     }
-    for (let bearing = 0; bearing < 360; bearing += 15) {
-      for (const factor of [0.48, 0.55, 0.62, 0.7]) {
+    for (let bearing = 0; bearing < 360; bearing += 20) {
+      for (const factor of [0.48, 0.55, 0.62]) {
         const farPoint = destinationPoint(req.start, bearing, minM * factor)
-        for (const farId of findNearbyNodes(graph, farPoint, 4)) {
+        for (const farId of findNearbyNodes(graph, farPoint, 3)) {
           consider(
-            tryOutAndBack(graph, startId, farId, softWeights),
+            tryOutAndBack(graph, startId, farId, softWeights, findPath),
             maxM * 1.25,
-            maxElevGainM * 1.4,
-          )
-          consider(
-            tryTwoLegLoop(graph, startId, farId, softWeights),
-            maxM * 1.25,
-            maxElevGainM * 1.4,
+            maxElevChangeM * 1.4,
           )
         }
       }
@@ -435,44 +576,82 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
   }
 
   status('Building map & elevation profile…')
-  let coordinates = pathToLatLng(graph, best.path)
-  // Ensure we finish at the start when the graph path is slightly open
-  if (
-    coordinates.length &&
-    haversineMeters(coordinates[0], coordinates[coordinates.length - 1]) > 15
-  ) {
-    coordinates = [...coordinates, coordinates[0]]
+  return finalizeRoute(graph, best, req.start, req.distanceMiles)
+}
+
+/**
+ * Drag a mid-route handle. `handleIndex` is into the visible controlPoints array
+ * (not including start/end).
+ */
+export async function dragRouteHandle(
+  handleIndex: number,
+  to: LatLng,
+): Promise<RouteResult> {
+  const session = activeSession
+  if (!session) throw new Error('No active route to edit. Route a run first.')
+
+  // controlIndexes: [start, h0, h1, ..., end] — visible handles are middle ones
+  const controlIdx = handleIndex + 1
+  if (controlIdx <= 0 || controlIdx >= session.controlIndexes.length - 1) {
+    throw new Error('That handle cannot be moved.')
   }
 
-  const dense = densify(coordinates, 60)
-  // Sample elevation along the route without hammering the API
-  const sampleEvery = Math.max(1, Math.ceil(dense.length / 120))
-  const samplePts = dense.filter((_, i) => i % sampleEvery === 0 || i === dense.length - 1)
-  const sampleElevs = await fetchElevationsSoft(samplePts)
-  const elevationsM = dense.map((_, i) => {
-    const idx = Math.min(sampleElevs.length - 1, Math.round(i / sampleEvery))
-    return sampleElevs[idx] ?? 0
-  })
-  const distanceMiles = displayMiles(pathLengthMeters(dense))
-  const elevGain = elevationGainFeet(elevationsM)
-  const elevMin = Math.min(...elevationsM)
-  const elevMax = Math.max(...elevationsM)
+  const prevPathIdx = session.controlIndexes[controlIdx - 1]
+  const nextPathIdx = session.controlIndexes[controlIdx + 1]
+  const prevNode = session.nodePath[prevPathIdx]
+  const nextNode = session.nodePath[nextPathIdx]
 
-  if (distanceMiles < req.distanceMiles) {
-    throw new Error(
-      `Routed distance came out under target (${distanceMiles.toFixed(2)} mi). Try increasing variance slightly.`,
+  const snapped = nearestGraphNodeId(session.graph, to, 300)
+  if (snapped === null) {
+    throw new Error('Could not snap that point to a nearby path.')
+  }
+
+  const findPath = createDijkstraCache()
+  const leg1 = findPath(session.graph, prevNode, snapped, DEFAULT_WEIGHTS)
+  const leg2 = findPath(session.graph, snapped, nextNode, DEFAULT_WEIGHTS)
+  if (!leg1 || !leg2) {
+    throw new Error('Could not re-route through that point.')
+  }
+
+  const newSlice = mergePaths([leg1.path, leg2.path])
+  const nodePath = [
+    ...session.nodePath.slice(0, prevPathIdx),
+    ...newSlice,
+    ...session.nodePath.slice(nextPathIdx + 1),
+  ]
+
+  // Recompute simple stats from path edges
+  const elev = elevAlongPath(session.graph, nodePath)
+  let lengthM = 0
+  let signals = 0
+  let crossings = 0
+  let turns = 0
+  let prevBearing: number | null = null
+  for (let i = 0; i < nodePath.length - 1; i++) {
+    const edge = (session.graph.adj.get(nodePath[i]) ?? []).find(
+      (e) => e.to === nodePath[i + 1],
     )
+    if (!edge) continue
+    lengthM += edge.lengthM
+    if (edge.hasSignal) signals += 1
+    if (edge.hasCrossing) crossings += 1
+    if (prevBearing !== null) {
+      const delta = turnAngleDegrees(prevBearing, edge.bearing)
+      if (delta > 25) turns += 1
+    }
+    prevBearing = edge.bearing
   }
 
-  return {
-    coordinates: dense,
-    elevationsM,
-    distanceMiles,
-    elevationGainFeet: elevGain,
-    elevationRangeFeet: metersToFeet(elevMax - elevMin),
-    signals: best.signals,
-    crossings: best.crossings,
-    turns: best.turns,
-    label: best.kind === 'out-and-back' ? 'Out and back' : 'Loop',
+  const candidate: RouteCandidate = {
+    kind: 'edited',
+    path: nodePath,
+    lengthM,
+    elevGainM: elev.gain,
+    elevLossM: elev.loss,
+    signals,
+    crossings,
+    turns,
   }
+
+  return finalizeRoute(session.graph, candidate, session.start, 0)
 }
