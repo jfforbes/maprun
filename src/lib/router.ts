@@ -18,6 +18,7 @@ import {
   countPathHazards,
   createDijkstraCache,
   DEFAULT_WEIGHTS,
+  MIN_TURN_DEGREES,
   nearestGraphNodeId,
   pathToLatLng,
   SHORTEST_WEIGHTS,
@@ -176,8 +177,8 @@ function scoreRoute(
     elevOver * 5 -
     // Each light is a major penalty vs small length differences
     stats.signals * 280 -
-    stats.crossings * 25 -
-    stats.turns * 1.2
+    stats.crossings * 5 -
+    stats.turns * 40
   )
 }
 
@@ -490,7 +491,7 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
 
   const weightSets: PathCostWeights[] = [
     DEFAULT_WEIGHTS,
-    { ...DEFAULT_WEIGHTS, signalPenalty: 1600, crossingPenalty: 180, turnPenalty: 25 },
+    { ...DEFAULT_WEIGHTS, signalPenalty: 1600, crossingPenalty: 20, turnPenalty: 140 },
   ]
 
   const search = {
@@ -596,9 +597,9 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
   if (!search.best || displayMiles(search.best.lengthM) < req.distanceMiles) {
     status('Stretching the route to meet distance…')
     const softWeights: PathCostWeights = {
-      turnPenalty: 10,
+      turnPenalty: 70,
       signalPenalty: 700,
-      crossingPenalty: 100,
+      crossingPenalty: 10,
       elevGainPenalty: 2,
     }
     for (let bearing = 0; bearing < 360; bearing += 20) {
@@ -693,7 +694,7 @@ export async function dragRouteHandle(
     lengthM += edge.lengthM
     if (prevBearing !== null) {
       const delta = turnAngleDegrees(prevBearing, edge.bearing)
-      if (delta > 25) turns += 1
+      if (delta > MIN_TURN_DEGREES) turns += 1
     }
     prevBearing = edge.bearing
   }
@@ -730,7 +731,7 @@ function candidateFromNodePath(
     lengthM += edge.lengthM
     if (prevBearing !== null) {
       const delta = turnAngleDegrees(prevBearing, edge.bearing)
-      if (delta > 25) turns += 1
+      if (delta > MIN_TURN_DEGREES) turns += 1
     }
     prevBearing = edge.bearing
   }

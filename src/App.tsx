@@ -402,7 +402,7 @@ export default function App() {
         )}
 
         <footer className="panel-foot">
-          Prefers paths with fewer lights, crossings, and turns. Built on
+          Prefers fewer lights and sharp turns (over 60°). Built on
           OpenStreetMap.
         </footer>
       </aside>

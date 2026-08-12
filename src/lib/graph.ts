@@ -121,10 +121,11 @@ export type PathCostWeights = {
 }
 
 export const DEFAULT_WEIGHTS: PathCostWeights = {
-  turnPenalty: 20,
-  // ~1km detour equivalent — lights should lose to quieter longer paths
+  // Strong preference to keep going straight; only big bends count as turns
+  turnPenalty: 90,
   signalPenalty: 1000,
-  crossingPenalty: 120,
+  // Crossings matter much less than lights/turns
+  crossingPenalty: 15,
   elevGainPenalty: 8,
 }
 
@@ -202,6 +203,9 @@ class MinHeap<T> {
   }
 }
 
+/** Only count bends sharper than this as turns (degrees). */
+export const MIN_TURN_DEGREES = 60
+
 export function dijkstra(
   graph: RunGraph,
   startId: number,
@@ -278,13 +282,14 @@ export function dijkstra(
       let turnCount = 0
       if (cur.bearing !== null) {
         turn = turnAngleDegrees(cur.bearing, edge.bearing)
-        if (turn > 25) turnCount = 1
+        if (turn > MIN_TURN_DEGREES) turnCount = 1
       }
 
       const stepCost = weights.shortestPath
         ? edge.lengthM
         : edge.lengthM * highwayMul +
-          (turn / 45) * weights.turnPenalty +
+          // Only apply turn cost for real bends (>60°)
+          (turn > MIN_TURN_DEGREES ? (turn / 90) * weights.turnPenalty : 0) +
           (edge.entersSignal ? weights.signalPenalty : 0) +
           (edge.entersCrossing ? weights.crossingPenalty : 0) +
           edge.elevGainM * weights.elevGainPenalty
