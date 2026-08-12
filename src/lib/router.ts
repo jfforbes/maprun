@@ -1,6 +1,7 @@
 import { fetchElevationsSoft } from './elevation'
 import {
   destinationPoint,
+  displayMiles,
   elevationGainFeet,
   haversineMeters,
   metersToFeet,
@@ -332,7 +333,10 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
     scoreElev = maxElevGainM,
   ) => {
     if (!candidate || candidate.path.length < 3) return
-    const gap = candidate.lengthM < minM ? minM - candidate.lengthM : 0
+    const gap =
+      displayMiles(candidate.lengthM) < req.distanceMiles
+        ? minM - candidate.lengthM
+        : 0
     if (gap < search.closestGap) {
       search.closestGap = gap
       search.closest = candidate
@@ -381,7 +385,7 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
     if (attempts > maxAttempts) break
     if (
       search.best &&
-      search.best.lengthM >= minM &&
+      displayMiles(search.best.lengthM) >= req.distanceMiles &&
       search.best.lengthM <= maxM
     ) {
       break
@@ -389,7 +393,7 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
   }
 
   // Fallback: stretch farther if everything was too short
-  if (!search.best || search.best.lengthM < minM) {
+  if (!search.best || displayMiles(search.best.lengthM) < req.distanceMiles) {
     status('Stretching the route to meet distance…')
     const softWeights: PathCostWeights = {
       turnPenalty: 10,
@@ -424,9 +428,9 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
     )
   }
 
-  if (best.lengthM < minM) {
+  if (displayMiles(best.lengthM) < req.distanceMiles) {
     throw new Error(
-      `Best route found was ${(best.lengthM / 1609.344).toFixed(2)} mi — under your ${req.distanceMiles} mi minimum. Increase variance or pick a denser street/path area.`,
+      `Best route found was ${displayMiles(best.lengthM).toFixed(2)} mi — under your ${req.distanceMiles} mi minimum. Increase variance or pick a denser street/path area.`,
     )
   }
 
@@ -449,7 +453,7 @@ export async function planRunRoute(req: RouteRequest): Promise<RouteResult> {
     const idx = Math.min(sampleElevs.length - 1, Math.round(i / sampleEvery))
     return sampleElevs[idx] ?? 0
   })
-  const distanceMiles = pathLengthMeters(dense) / 1609.344
+  const distanceMiles = displayMiles(pathLengthMeters(dense))
   const elevGain = elevationGainFeet(elevationsM)
   const elevMin = Math.min(...elevationsM)
   const elevMax = Math.max(...elevationsM)

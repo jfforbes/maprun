@@ -65,8 +65,13 @@ export function milesToMeters(miles: number): number {
   return miles * 1609.344
 }
 
-export function metersToMiles(meters: number): number {
+function metersToMiles(meters: number): number {
   return meters / 1609.344
+}
+
+/** User-facing mile distance (2 decimals) — used so 2.996 doesn't reject as "under 3.00". */
+export function displayMiles(meters: number): number {
+  return Math.round(metersToMiles(meters) * 100) / 100
 }
 
 export function pathLengthMeters(points: LatLng[]): number {
