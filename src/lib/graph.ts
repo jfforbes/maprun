@@ -113,39 +113,13 @@ export function buildGraph(
     }
   }
 
-  inferBusyIntersections(adj, signalNodes)
-
   return {
     adj,
     nodePos,
     elevations,
     signalNodes,
     crossingNodes,
-    signalClusters: clusterPoints(
-      [
-        ...network.signals,
-        ...[...signalNodes]
-          .map((id) => nodePos.get(id))
-          .filter((p): p is LatLng => Boolean(p)),
-      ],
-      55,
-    ),
-  }
-}
-
-const BUSY_ROAD = new Set(['tertiary', 'secondary', 'primary'])
-
-/** OSM often skips lights at bigger intersections. Treat busy crosses as signals. */
-function inferBusyIntersections(
-  adj: Map<number, GraphEdge[]>,
-  signalNodes: Set<number>,
-): void {
-  for (const [id, edges] of adj) {
-    if (signalNodes.has(id) || edges.length < 4) continue
-    const busyWays = new Set(
-      edges.filter((e) => BUSY_ROAD.has(e.highway)).map((e) => e.wayId),
-    )
-    if (busyWays.size >= 2) signalNodes.add(id)
+    signalClusters: clusterPoints(network.signals, 55),
   }
 }
 
@@ -486,7 +460,7 @@ export function countPathHazards(
     const pos = graph.nodePos.get(id)
     if (pos) {
       graph.signalClusters.forEach((c, i) => {
-        if (haversineMeters(pos, c) <= 40) hitSignals.add(i)
+        if (haversineMeters(pos, c) <= 50) hitSignals.add(i)
       })
     }
     if (seenCross.has(id)) continue

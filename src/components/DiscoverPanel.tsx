@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { AddressAutocomplete } from './AddressAutocomplete'
+import { StatusProgress } from './StatusProgress'
 import { discoverRuns, type DiscoverHit } from '../lib/discover'
 import { geocodeAddress, type GeocodeResult } from '../lib/geocode'
 import { buildGpx, downloadGpx } from '../lib/gpx'
@@ -30,9 +31,11 @@ const defaults: FormState = {
 type Props = {
   busy: boolean
   status: string | null
+  progress?: number | null
   error: string | null
   onBusy: (busy: boolean) => void
   onStatus: (status: string | null) => void
+  onProgress: (progress: number | null) => void
   onError: (error: string | null) => void
   onSelectHit: (hit: DiscoverHit) => void
   selectedId: string | null
@@ -46,9 +49,11 @@ type Props = {
 export function DiscoverPanel({
   busy,
   status,
+  progress,
   error,
   onBusy,
   onStatus,
+  onProgress,
   onError,
   onSelectHit,
   selectedId,
@@ -123,6 +128,7 @@ export function DiscoverPanel({
 
     onBusy(true)
     try {
+      onProgress(0.02)
       onStatus('Resolving home base…')
       const origin = await ensureHome()
       const found = await discoverRuns({
@@ -133,6 +139,7 @@ export function DiscoverPanel({
         maxClimbFeet: maxElevationFeet,
         allowLights: form.allowLights,
         onStatus,
+        onProgress,
       })
       onHits(found)
       if (found[0]) {
@@ -140,8 +147,10 @@ export function DiscoverPanel({
         onSelectHit(found[0])
       }
       onStatus(null)
+      onProgress(null)
     } catch (err) {
       onStatus(null)
+      onProgress(null)
       onError(err instanceof Error ? err.message : 'Could not find runs.')
     } finally {
       onBusy(false)
@@ -280,7 +289,7 @@ export function DiscoverPanel({
         </button>
       </form>
 
-      {status && <p className="status">{status}</p>}
+      <StatusProgress status={status} progress={busy ? progress : null} />
       {error && <p className="error">{error}</p>}
 
       {hits.length > 0 && (
@@ -344,7 +353,7 @@ export function DiscoverPanel({
               <strong>{Math.round(selected.route.elevationGainFeet)} ft</strong>
             </li>
             <li>
-              <span>Signals</span>
+              <span>Lights (OSM)</span>
               <strong>{selected.route.signals}</strong>
             </li>
           </ul>

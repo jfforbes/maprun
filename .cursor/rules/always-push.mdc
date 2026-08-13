@@ -1,0 +1,12 @@
+---
+description: Always commit and push shipped work to origin without waiting for review
+alwaysApply: true
+---
+
+# Always push
+
+James wants changes shipped without a review pause.
+
+- After finishing a requested change, create a git commit (when there is something to commit) and `git push` to `origin` on the current branch.
+- Do not wait to be asked to push.
+- Never force-push unless he explicitly asks.

@@ -199,10 +199,9 @@ function parseNetwork(
       !isRampMeter &&
       (tags.highway === 'traffic_signals' ||
         tags.crossing === 'traffic_signals' ||
-        tags['crossing:signals'] === 'yes' ||
-        tags.flashing_lights === 'yes' ||
         (tags.traffic_signals !== undefined &&
-          tags.traffic_signals !== 'ramp_meter'))
+          tags.traffic_signals !== 'ramp_meter' &&
+          tags.traffic_signals !== 'blinker'))
     if (isSignal) {
       markNear(point, 'isSignal', signals)
     }

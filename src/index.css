@@ -418,6 +418,30 @@ input {
   color: var(--accent-deep);
 }
 
+.status-progress {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.status-progress .status {
+  margin: 0;
+}
+
+.progress-track {
+  height: 0.55rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 12%, white);
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 180ms ease;
+}
+
 .error {
   background: color-mix(in srgb, var(--warn) 12%, white);
   color: var(--warn);

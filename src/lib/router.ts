@@ -2,7 +2,6 @@ import { fetchElevationsSoft } from './elevation'
 import {
   destinationPoint,
   displayMiles,
-  elevationChangeFeet,
   elevationGainFeet,
   elevationLossFeet,
   haversineMeters,
@@ -45,6 +44,8 @@ export type RouteRequest = {
   /** How many auto-route alternatives to return (default 3). */
   optionCount?: number
   onStatus?: (message: string) => void
+  /** 0–1 while auto-routing. */
+  onProgress?: (fraction: number) => void
 }
 
 export type RouteResult = {
@@ -359,6 +360,30 @@ function findNearbyNodes(
   }
   const preferred = collect(minDegree)
   return preferred.length ? preferred : collect(1)
+}
+
+function elevationsAlongPath(
+  graph: RunGraph,
+  path: number[],
+  along: LatLng[],
+): number[] {
+  if (path.length === 0 || along.length === 0) return along.map(() => 0)
+  const nodeElevs = path.map((id) => graph.elevations.get(id) ?? 0)
+  if (along.length === 1) return [nodeElevs[0] ?? 0]
+  return along.map((pt) => {
+    let best = nodeElevs[0] ?? 0
+    let bestD = Infinity
+    for (let i = 0; i < path.length; i++) {
+      const pos = graph.nodePos.get(path[i])
+      if (!pos) continue
+      const d = haversineMeters(pt, pos)
+      if (d < bestD) {
+        bestD = d
+        best = nodeElevs[i] ?? 0
+      }
+    }
+    return best
+  })
 }
 
 function elevAlongPath(
@@ -722,14 +747,29 @@ async function buildRouteResult(
     (_, i) => i % sampleEvery === 0 || i === dense.length - 1,
   )
   const sampleElevs = await fetchElevationsSoft(samplePts)
-  const elevationsM = dense.map((_, i) => {
-    const idx = Math.min(sampleElevs.length - 1, Math.round(i / sampleEvery))
-    return sampleElevs[idx] ?? 0
-  })
+  const sampleSpan =
+    sampleElevs.length > 0
+      ? Math.max(...sampleElevs) - Math.min(...sampleElevs)
+      : 0
+  const apiLooksLive = sampleElevs.some((e) => e !== 0) && sampleSpan > 0.25
+  const graphProfile = elevationsAlongPath(graph, candidate.path, dense)
+  const elevationsM = apiLooksLive
+    ? dense.map((_, i) => {
+        const idx = Math.min(
+          sampleElevs.length - 1,
+          Math.round(i / sampleEvery),
+        )
+        return sampleElevs[idx] ?? 0
+      })
+    : graphProfile
   const distanceMiles = displayMiles(pathLengthMeters(dense))
-  const elevGain = elevationGainFeet(elevationsM)
-  const elevLoss = elevationLossFeet(elevationsM)
-  const elevChange = elevationChangeFeet(elevationsM)
+  const sampleGain = elevationGainFeet(apiLooksLive ? sampleElevs : graphProfile)
+  const sampleLoss = elevationLossFeet(apiLooksLive ? sampleElevs : graphProfile)
+  const graphGainFt = metersToFeet(candidate.elevGainM)
+  const graphLossFt = metersToFeet(candidate.elevLossM)
+  const elevGain = sampleGain > 1 ? sampleGain : Math.max(sampleGain, graphGainFt)
+  const elevLoss = sampleLoss > 1 ? sampleLoss : Math.max(sampleLoss, graphLossFt)
+  const elevChange = elevGain + elevLoss
   const elevMin = Math.min(...elevationsM)
   const elevMax = Math.max(...elevationsM)
 
@@ -791,6 +831,10 @@ async function finalizeRoute(
 
 export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
   const status = req.onStatus ?? (() => {})
+  const report = (message: string, fraction: number) => {
+    status(message)
+    req.onProgress?.(Math.min(0.99, Math.max(0, fraction)))
+  }
   manualDraw = null
   plannedBundle = null
   editHistory = []
@@ -802,13 +846,13 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
 
   const radiusM = Math.min(5000, Math.max(1100, minM * 0.7))
 
-  status('Loading streets & paths…')
+  report('Loading streets & paths…', 0.06)
   const network = await fetchOsmNetwork(req.start, radiusM)
   if (network.ways.length < 5) {
     throw new Error('Not enough walkable roads near that start point.')
   }
 
-  status('Reading elevation…')
+  report('Reading elevation…', 0.16)
   const elevByNode = await elevationsForNetwork(network)
   const graph = buildGraph(network, elevByNode)
   const findPath = createDijkstraCache()
@@ -818,10 +862,11 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
     throw new Error('Could not snap the start point to a walkable road.')
   }
 
-  status(
+  report(
     allowLights
       ? 'Searching for route options…'
       : 'Searching for quiet route options…',
+    0.22,
   )
 
   const outAndBackRadii = [minM * 0.45, minM * 0.5, minM * 0.55]
@@ -913,13 +958,21 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
     optionCount
 
   let attempts = 0
+  const searchTotal = Math.max(1, weightSets.length * bearings.length)
+  let searchDone = 0
 
   // Pass 1: loops first (two-leg + triangle)
   for (let wi = 0; wi < weightSets.length; wi++) {
     const weights = weightSets[wi]
     if (!weights) continue
     for (const bearing of bearings) {
-      if (++attempts % 6 === 0) await yieldToUi()
+      searchDone += 1
+      attempts += 1
+      report(
+        `Searching for routes… ${Math.round((searchDone / searchTotal) * 100)}%`,
+        0.22 + 0.55 * (searchDone / searchTotal),
+      )
+      await yieldToUi()
       for (const radius of loopRadii) {
         const farPoint = destinationPoint(req.start, bearing, radius)
         for (const farId of findNearbyNodes(graph, farPoint, 3, 3)) {
@@ -959,10 +1012,11 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
     displayMiles(search.best.lengthM) < req.distanceMiles ||
     search.best.lengthM > maxM
   ) {
-    status('Trying out-and-back as backup…')
+    report('Trying out-and-back as backup…', 0.78)
     for (const weights of weightSets) {
       for (const bearing of bearings) {
-        if (++attempts % 8 === 0) await yieldToUi()
+        attempts += 1
+        if (attempts % 3 === 0) await yieldToUi()
         for (const radius of outAndBackRadii) {
           const farPoint = destinationPoint(req.start, bearing, radius)
           for (const farId of findNearbyNodes(graph, farPoint, 3)) {
@@ -983,7 +1037,7 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
   }
 
   if (!search.best || displayMiles(search.best.lengthM) < req.distanceMiles) {
-    status('Stretching the route to meet distance…')
+    report('Stretching the route to meet distance…', 0.86)
     const softWeights: PathCostWeights = {
       turnPenalty: 70,
       signalPenalty: allowLights ? 0 : 80,
@@ -1037,10 +1091,11 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
   )
   if (selected.length === 0) selected = [best]
 
-  status(
+  report(
     selected.length > 1
       ? `Building ${selected.length} route options…`
       : 'Building map & elevation profile…',
+    0.92,
   )
 
   const options: PlannedOption[] = []
@@ -1092,6 +1147,7 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
     start: req.start,
   }
 
+  req.onProgress?.(1)
   return {
     routes: options.map((o) => o.result),
     selectedIndex: 0,

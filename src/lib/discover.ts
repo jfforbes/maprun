@@ -16,6 +16,7 @@ export type DiscoverRequest = {
   maxClimbFeet: number
   allowLights?: boolean
   onStatus?: (message: string) => void
+  onProgress?: (fraction: number) => void
 }
 
 export type DiscoverHit = {
@@ -264,6 +265,7 @@ export async function discoverRuns(
   req: DiscoverRequest,
 ): Promise<DiscoverHit[]> {
   const status = req.onStatus ?? (() => {})
+  const progress = req.onProgress ?? (() => {})
   const radiusM = milesToMeters(req.searchRadiusMiles)
 
   if (req.searchRadiusMiles <= 0 || req.searchRadiusMiles > 40) {
@@ -291,6 +293,7 @@ export async function discoverRuns(
     const driveMiles =
       Math.round((haversineMeters(req.home, hub.location) / 1609.344) * 10) / 10
     status(`Routing ${i + 1}/${hubs.length}: ${hub.label}…`)
+    progress(i / hubs.length)
     try {
       const planned = await planRunRoute({
         start: hub.location,
@@ -300,6 +303,7 @@ export async function discoverRuns(
         allowLights: req.allowLights,
         optionCount: 1,
         onStatus: (m) => status(`${hub.label}: ${m}`),
+        onProgress: (p) => progress((i + p) / hubs.length),
       })
       const route = planned.routes[0]
       if (!route) continue

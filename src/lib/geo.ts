@@ -111,7 +111,7 @@ export function elevationGainFeet(elevationsM: number[]): number {
   let gain = 0
   for (let i = 1; i < elevationsM.length; i++) {
     const d = elevationsM[i] - elevationsM[i - 1]
-    if (d > 0.5) gain += d
+    if (d > 0) gain += d
   }
   return gain * 3.28084
 }
@@ -120,7 +120,7 @@ export function elevationLossFeet(elevationsM: number[]): number {
   let loss = 0
   for (let i = 1; i < elevationsM.length; i++) {
     const d = elevationsM[i - 1] - elevationsM[i]
-    if (d > 0.5) loss += d
+    if (d > 0) loss += d
   }
   return loss * 3.28084
 }

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { AddressAutocomplete } from './components/AddressAutocomplete'
 import { DiscoverPanel } from './components/DiscoverPanel'
 import { RunMap } from './components/RunMap'
+import { StatusProgress } from './components/StatusProgress'
 import { geocodeAddress, type GeocodeResult } from './lib/geocode'
 import { buildGpx, downloadGpx } from './lib/gpx'
 import type { DiscoverHit } from './lib/discover'
@@ -54,6 +55,7 @@ export default function App() {
   const [moreAvailable, setMoreAvailable] = useState(false)
   const [drawing, setDrawing] = useState(false)
   const [status, setStatus] = useState<string | null>(null)
+  const [progress, setProgress] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [mapFocus, setMapFocus] = useState(false)
@@ -96,7 +98,7 @@ export default function App() {
       { label: 'Elev gain', value: `${Math.round(route.elevationGainFeet)} ft` },
       { label: 'Elev loss', value: `${Math.round(route.elevationLossFeet)} ft` },
       { label: 'Elev range', value: `${Math.round(route.elevationRangeFeet)} ft` },
-      { label: 'Signals', value: String(route.signals) },
+      { label: 'Lights (OSM)', value: String(route.signals) },
       { label: 'Crossings', value: String(route.crossings) },
       { label: 'Turns', value: String(route.turns) },
     ]
@@ -376,6 +378,7 @@ export default function App() {
 
     setBusy(true)
     try {
+      setProgress(0.02)
       setStatus('Resolving start…')
       const origin = await ensureStart()
 
@@ -386,6 +389,7 @@ export default function App() {
         maxClimbFeet: maxElevationFeet,
         allowLights: form.allowLights,
         onStatus: setStatus,
+        onProgress: setProgress,
       })
 
       setRouteOptions(planned.routes)
@@ -394,8 +398,10 @@ export default function App() {
       setMoreAvailable(hasMorePlannedRoutes())
       setCanUndoEdit(false)
       setStatus(null)
+      setProgress(null)
     } catch (err) {
       setStatus(null)
+      setProgress(null)
       setError(err instanceof Error ? err.message : 'Something went wrong.')
     } finally {
       setBusy(false)
@@ -481,7 +487,9 @@ export default function App() {
             error={error}
             onBusy={setBusy}
             onStatus={setStatus}
+            onProgress={setProgress}
             onError={setError}
+            progress={progress}
             hits={discoverHits}
             onHits={setDiscoverHits}
             selectedId={discoverSelectedId}
@@ -641,7 +649,7 @@ export default function App() {
           )}
         </form>
 
-        {status && <p className="status">{status}</p>}
+        <StatusProgress status={status} progress={busy ? progress : null} />
         {error && <p className="error">{error}</p>}
 
         {(routeOptions.length > 1 || moreAvailable) && (
@@ -692,6 +700,8 @@ export default function App() {
             <h2>Route</h2>
             <p className="field-hint">
               Click the route to add a waypoint, or drag the green handles.
+              Light counts come from OpenStreetMap traffic-signal tags — coverage
+              is patchy, so a street you know has lights may show none.
             </p>
             <ul>
               {summary.map((item) => (
