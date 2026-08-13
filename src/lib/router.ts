@@ -1,4 +1,4 @@
-import { fetchElevationsSoft } from './elevation'
+import { fetchElevations, fetchElevationsSoft } from './elevation'
 import {
   destinationPoint,
   displayMiles,
@@ -469,6 +469,72 @@ function tryThreeLegLoop(
   return loop
 }
 
+function networkBBox(points: LatLng[]): {
+  minLat: number
+  maxLat: number
+  minLng: number
+  maxLng: number
+} {
+  let minLat = Infinity
+  let maxLat = -Infinity
+  let minLng = Infinity
+  let maxLng = -Infinity
+  for (const p of points) {
+    if (p.lat < minLat) minLat = p.lat
+    if (p.lat > maxLat) maxLat = p.lat
+    if (p.lng < minLng) minLng = p.lng
+    if (p.lng > maxLng) maxLng = p.lng
+  }
+  return { minLat, maxLat, minLng, maxLng }
+}
+
+function latLngGrid(
+  box: { minLat: number; maxLat: number; minLng: number; maxLng: number },
+  rows: number,
+  cols: number,
+): LatLng[] {
+  const pts: LatLng[] = []
+  const latSpan = box.maxLat - box.minLat || 0.01
+  const lngSpan = box.maxLng - box.minLng || 0.01
+  for (let i = 0; i < rows; i++) {
+    const lat = box.minLat + latSpan * (rows === 1 ? 0.5 : i / (rows - 1))
+    for (let j = 0; j < cols; j++) {
+      const lng = box.minLng + lngSpan * (cols === 1 ? 0.5 : j / (cols - 1))
+      pts.push({ lat, lng })
+    }
+  }
+  return pts
+}
+
+function bilinearOnGrid(
+  lat: number,
+  lng: number,
+  box: { minLat: number; maxLat: number; minLng: number; maxLng: number },
+  rows: number,
+  cols: number,
+  elevs: number[],
+): number {
+  if (rows < 2 || cols < 2) return elevs[0] ?? 0
+  const fy = ((lat - box.minLat) / (box.maxLat - box.minLat || 1)) * (rows - 1)
+  const fx = ((lng - box.minLng) / (box.maxLng - box.minLng || 1)) * (cols - 1)
+  const y0 = Math.max(0, Math.min(rows - 2, Math.floor(fy)))
+  const x0 = Math.max(0, Math.min(cols - 2, Math.floor(fx)))
+  const y1 = y0 + 1
+  const x1 = x0 + 1
+  const ty = Math.max(0, Math.min(1, fy - y0))
+  const tx = Math.max(0, Math.min(1, fx - x0))
+  const e00 = elevs[y0 * cols + x0] ?? 0
+  const e10 = elevs[y0 * cols + x1] ?? 0
+  const e01 = elevs[y1 * cols + x0] ?? 0
+  const e11 = elevs[y1 * cols + x1] ?? 0
+  return (
+    e00 * (1 - tx) * (1 - ty) +
+    e10 * tx * (1 - ty) +
+    e01 * (1 - tx) * ty +
+    e11 * tx * ty
+  )
+}
+
 async function elevationsForNetwork(
   network: OsmNetwork,
 ): Promise<Map<number, number>> {
@@ -482,36 +548,27 @@ async function elevationsForNetwork(
     points.push({ lat: n.lat, lng: n.lng })
   }
 
-  const maxSamples = 180
   const elevMap = new Map<number, number>()
-  if (points.length <= maxSamples) {
-    const elevs = await fetchElevationsSoft(points)
+  try {
+    const elevs = await fetchElevations(points)
     ids.forEach((id, i) => elevMap.set(id, elevs[i] ?? 0))
-  } else {
-    const step = Math.ceil(points.length / maxSamples)
-    const samplePts: LatLng[] = []
-    const sampleIds: number[] = []
-    for (let i = 0; i < points.length; i += step) {
-      samplePts.push(points[i])
-      sampleIds.push(ids[i])
-    }
-    const elevs = await fetchElevationsSoft(samplePts)
-    sampleIds.forEach((id, i) => elevMap.set(id, elevs[i] ?? 0))
-    for (let i = 0; i < ids.length; i++) {
-      if (elevMap.has(ids[i])) continue
-      let nearest = 0
-      let nearestD = Infinity
-      for (let s = 0; s < samplePts.length; s++) {
-        const d = haversineMeters(points[i], samplePts[s])
-        if (d < nearestD) {
-          nearestD = d
-          nearest = s
-        }
-      }
-      elevMap.set(ids[i], elevs[nearest] ?? 0)
-    }
+    return elevMap
+  } catch {
+    // DEM tiles unavailable — interpolate a coarse API grid instead of zeros.
+    const box = networkBBox(points)
+    const rows = 16
+    const cols = 16
+    const grid = latLngGrid(box, rows, cols)
+    const gridElevs = await fetchElevationsSoft(grid)
+    ids.forEach((id, i) => {
+      const p = points[i]
+      elevMap.set(
+        id,
+        p ? bilinearOnGrid(p.lat, p.lng, box, rows, cols, gridElevs) : 0,
+      )
+    })
+    return elevMap
   }
-  return elevMap
 }
 
 function yieldToUi(): Promise<void> {
@@ -741,37 +798,26 @@ async function buildRouteResult(
     coordinates = [...coordinates, coordinates[0]]
   }
 
-  const dense = densify(coordinates, 60)
-  const sampleEvery = Math.max(1, Math.ceil(dense.length / 120))
-  const samplePts = dense.filter(
-    (_, i) => i % sampleEvery === 0 || i === dense.length - 1,
-  )
-  const sampleElevs = await fetchElevationsSoft(samplePts)
-  const sampleSpan =
-    sampleElevs.length > 0
-      ? Math.max(...sampleElevs) - Math.min(...sampleElevs)
-      : 0
-  const apiLooksLive = sampleElevs.some((e) => e !== 0) && sampleSpan > 0.25
-  const graphProfile = elevationsAlongPath(graph, candidate.path, dense)
-  const elevationsM = apiLooksLive
-    ? dense.map((_, i) => {
-        const idx = Math.min(
-          sampleElevs.length - 1,
-          Math.round(i / sampleEvery),
-        )
-        return sampleElevs[idx] ?? 0
-      })
-    : graphProfile
+  const dense = densify(coordinates, 40)
+  const elevationsM = await fetchElevationsSoft(dense)
+  const sampled =
+    elevationsM.some((e) => e !== 0) &&
+    Math.max(...elevationsM) - Math.min(...elevationsM) > 0.5
+  const profile = sampled
+    ? elevationsM
+    : elevationsAlongPath(graph, candidate.path, dense)
   const distanceMiles = displayMiles(pathLengthMeters(dense))
-  const sampleGain = elevationGainFeet(apiLooksLive ? sampleElevs : graphProfile)
-  const sampleLoss = elevationLossFeet(apiLooksLive ? sampleElevs : graphProfile)
-  const graphGainFt = metersToFeet(candidate.elevGainM)
-  const graphLossFt = metersToFeet(candidate.elevLossM)
-  const elevGain = sampleGain > 1 ? sampleGain : Math.max(sampleGain, graphGainFt)
-  const elevLoss = sampleLoss > 1 ? sampleLoss : Math.max(sampleLoss, graphLossFt)
+  const elevGain = Math.max(
+    elevationGainFeet(profile),
+    metersToFeet(candidate.elevGainM),
+  )
+  const elevLoss = Math.max(
+    elevationLossFeet(profile),
+    metersToFeet(candidate.elevLossM),
+  )
   const elevChange = elevGain + elevLoss
-  const elevMin = Math.min(...elevationsM)
-  const elevMax = Math.max(...elevationsM)
+  const elevMin = Math.min(...profile)
+  const elevMax = Math.max(...profile)
 
   if (minDistanceMiles > 0 && distanceMiles < minDistanceMiles) {
     throw new Error(
@@ -784,7 +830,7 @@ async function buildRouteResult(
     : buildControlIndexes(graph, candidate.path)
   const result: RouteResult = {
     coordinates: dense,
-    elevationsM,
+    elevationsM: profile,
     distanceMiles,
     elevationGainFeet: elevGain,
     elevationLossFeet: elevLoss,
