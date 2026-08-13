@@ -47,7 +47,7 @@ const ENDPOINTS = [
   'https://overpass.kumi.systems/api/interpreter',
 ]
 
-export async function overpassQuery(query: string): Promise<OverpassElement[]> {
+async function overpassQuery(query: string): Promise<OverpassElement[]> {
   let lastError: Error | null = null
 
   for (const endpoint of ENDPOINTS) {

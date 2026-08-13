@@ -1,10 +1,8 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { AddressAutocomplete } from './components/AddressAutocomplete'
-import { DiscoverPanel } from './components/DiscoverPanel'
 import { RunMap } from './components/RunMap'
 import { geocodeAddress, type GeocodeResult } from './lib/geocode'
 import { buildGpx, downloadGpx } from './lib/gpx'
-import type { DiscoverHit } from './lib/discover'
 import type { LatLng } from './lib/geo'
 import {
   addManualWaypoint,
@@ -13,13 +11,13 @@ import {
   clearPlannedRoutes,
   dragRouteHandle,
   finishManualAtStart,
+  hasMorePlannedRoutes,
+  morePlannedRoutes,
   planRunRoute,
   selectPlannedRoute,
   undoManualWaypoint,
   type RouteResult,
 } from './lib/router'
-
-type TabId = 'nearby' | 'discover'
 
 type FormState = {
   location: string
@@ -36,7 +34,6 @@ const defaults: FormState = {
 }
 
 export default function App() {
-  const [tab, setTab] = useState<TabId>('nearby')
   const [form, setForm] = useState<FormState>(defaults)
   const [start, setStart] = useState<LatLng | null>(null)
   const [resolvedLabel, setResolvedLabel] = useState<string | null>(null)
@@ -44,33 +41,15 @@ export default function App() {
   const [route, setRoute] = useState<RouteResult | null>(null)
   const [routeOptions, setRouteOptions] = useState<RouteResult[]>([])
   const [selectedOption, setSelectedOption] = useState(0)
+  const [moreAvailable, setMoreAvailable] = useState(false)
   const [drawing, setDrawing] = useState(false)
   const [status, setStatus] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [mapFocus, setMapFocus] = useState(false)
-  const [discoverHits, setDiscoverHits] = useState<DiscoverHit[]>([])
-  const [discoverSelectedId, setDiscoverSelectedId] = useState<string | null>(
-    null,
-  )
-  const [discoverHome, setDiscoverHome] = useState<LatLng | null>(null)
-
-  const selectedDiscover = useMemo(
-    () => discoverHits.find((h) => h.id === discoverSelectedId) ?? null,
-    [discoverHits, discoverSelectedId],
-  )
 
   const canExport = Boolean(route?.coordinates.length)
-  const mapMode =
-    tab === 'discover'
-      ? selectedDiscover
-        ? 'view'
-        : 'pick-start'
-      : drawing
-        ? 'draw'
-        : route
-          ? 'view'
-          : 'pick-start'
+  const mapMode = drawing ? 'draw' : route ? 'view' : 'pick-start'
 
   const canStart = Boolean(start || form.location.trim())
 
@@ -79,7 +58,7 @@ export default function App() {
   }, [drawing])
 
   const summary = useMemo(() => {
-    if (tab !== 'nearby' || !route) return null
+    if (!route) return null
     return [
       { label: 'Type', value: route.label },
       { label: 'Distance', value: `${route.distanceMiles.toFixed(2)} mi` },
@@ -91,26 +70,13 @@ export default function App() {
       { label: 'Crossings', value: String(route.crossings) },
       { label: 'Turns', value: String(route.turns) },
     ]
-  }, [route, tab])
-
-  function switchTab(next: TabId) {
-    if (next === tab) return
-    setTab(next)
-    setError(null)
-    setStatus(null)
-    setMapFocus(false)
-    if (next === 'nearby') {
-      setDiscoverSelectedId(null)
-    } else {
-      setDrawing(false)
-      cancelManualRoute()
-    }
-  }
+  }, [route])
 
   function clearRoutes() {
     setRoute(null)
     setRouteOptions([])
     setSelectedOption(0)
+    setMoreAvailable(false)
     clearPlannedRoutes()
   }
 
@@ -125,13 +91,6 @@ export default function App() {
   }
 
   function onPickStart(point: LatLng) {
-    if (tab === 'discover') {
-      const label = `${point.lat.toFixed(5)}, ${point.lng.toFixed(5)}`
-      setDiscoverHome(point)
-      setStart(point)
-      setResolvedLabel(label)
-      return
-    }
     cancelManualRoute()
     setDrawing(false)
     const label = `${point.lat.toFixed(5)}, ${point.lng.toFixed(5)}`
@@ -140,15 +99,6 @@ export default function App() {
     setForm((f) => ({ ...f, location: label }))
     setPickedFromSuggestions(true)
     clearRoutes()
-  }
-
-  function onSelectDiscoverHit(hit: DiscoverHit) {
-    setDiscoverSelectedId(hit.id)
-    setRoute(hit.route)
-    setRouteOptions([])
-    setSelectedOption(0)
-    setStart(hit.parking)
-    setResolvedLabel(hit.name)
   }
 
   async function ensureStart(): Promise<LatLng> {
@@ -181,6 +131,7 @@ export default function App() {
       setRoute(null)
       setRouteOptions([])
       setSelectedOption(0)
+      setMoreAvailable(false)
       setDrawing(true)
       setStatus('Click the map to add waypoints. Streets will connect them.')
     } catch (err) {
@@ -330,10 +281,29 @@ export default function App() {
       setRouteOptions(planned.routes)
       setSelectedOption(planned.selectedIndex)
       setRoute(planned.routes[planned.selectedIndex] ?? null)
+      setMoreAvailable(hasMorePlannedRoutes())
       setStatus(null)
     } catch (err) {
       setStatus(null)
       setError(err instanceof Error ? err.message : 'Something went wrong.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function onMoreOptions() {
+    if (busy || drawing) return
+    setError(null)
+    setBusy(true)
+    try {
+      setStatus('Finding more routes…')
+      const planned = await morePlannedRoutes(2)
+      setRouteOptions(planned.routes)
+      setMoreAvailable(hasMorePlannedRoutes())
+      setStatus(null)
+    } catch (err) {
+      setStatus(null)
+      setError(err instanceof Error ? err.message : 'Could not find more routes.')
     } finally {
       setBusy(false)
     }
@@ -365,56 +335,10 @@ export default function App() {
               {mapFocus ? 'Show controls' : 'Focus map'}
             </button>
           </div>
-          <div className="tab-row" role="tablist" aria-label="MapRun modes">
-            <button
-              type="button"
-              role="tab"
-              className={`tab${tab === 'nearby' ? ' is-active' : ''}`}
-              aria-selected={tab === 'nearby'}
-              disabled={busy}
-              onClick={() => switchTab('nearby')}
-            >
-              From here
-            </button>
-            <button
-              type="button"
-              role="tab"
-              className={`tab${tab === 'discover' ? ' is-active' : ''}`}
-              aria-selected={tab === 'discover'}
-              disabled={busy}
-              onClick={() => switchTab('discover')}
-            >
-              Find runs
-            </button>
-          </div>
-          {tab === 'nearby' && (
-            <p className="brand-sub">Quiet routes. Exact miles. Exportable.</p>
-          )}
+          <p className="brand-sub">Quiet routes. Exact miles. Exportable.</p>
         </header>
 
         <div id="route-controls" className="panel-body">
-        {tab === 'discover' ? (
-          <DiscoverPanel
-            busy={busy}
-            status={status}
-            error={error}
-            onBusy={setBusy}
-            onStatus={setStatus}
-            onError={setError}
-            hits={discoverHits}
-            onHits={setDiscoverHits}
-            selectedId={discoverSelectedId}
-            onSelectHit={onSelectDiscoverHit}
-            home={discoverHome}
-            homeLabel={tab === 'discover' ? resolvedLabel : null}
-            onHome={(point, label) => {
-              setDiscoverHome(point)
-              setStart(point)
-              setResolvedLabel(label)
-            }}
-          />
-        ) : (
-          <>
         <form className="route-form" onSubmit={onSubmit}>
           <label className="field">
             <span>Starting location</span>
@@ -534,7 +458,7 @@ export default function App() {
         {status && <p className="status">{status}</p>}
         {error && <p className="error">{error}</p>}
 
-        {routeOptions.length > 1 && (
+        {(routeOptions.length > 1 || moreAvailable) && (
           <section className="route-options" aria-label="Route options">
             <h2>Choose a route</h2>
             <div className="route-option-list">
@@ -564,6 +488,16 @@ export default function App() {
                 )
               })}
             </div>
+            {moreAvailable && (
+              <button
+                className="btn ghost more-options-btn"
+                type="button"
+                disabled={busy}
+                onClick={onMoreOptions}
+              >
+                More options
+              </button>
+            )}
           </section>
         )}
 
@@ -593,8 +527,6 @@ export default function App() {
           Prefers lower climb first, then fewer lights, turns, and crossings.
           Built on OpenStreetMap.
         </footer>
-          </>
-        )}
         </div>
       </aside>
 
@@ -608,7 +540,7 @@ export default function App() {
             >
               Controls
             </button>
-            {drawing && tab === 'nearby' && (
+            {drawing && (
               <div className="map-chrome-actions">
                 <button
                   className="btn ghost map-chrome-btn"
@@ -631,34 +563,21 @@ export default function App() {
           </div>
         )}
         <RunMap
-          start={
-            tab === 'discover'
-              ? (selectedDiscover?.parking ?? discoverHome ?? start)
-              : start
-          }
-          route={
-            tab === 'discover'
-              ? (selectedDiscover?.route.coordinates ?? null)
-              : (route?.coordinates ?? null)
-          }
+          start={start}
+          route={route?.coordinates ?? null}
           alternateRoutes={
-            tab === 'nearby' && routeOptions.length > 1
+            routeOptions.length > 1
               ? routeOptions
                   .filter((_, i) => i !== selectedOption)
                   .map((r) => r.coordinates)
               : null
           }
-          controlPoints={
-            tab === 'nearby' ? (route?.controlPoints ?? null) : null
-          }
-          waypoints={tab === 'nearby' ? (route?.waypoints ?? null) : null}
-          parking={
-            tab === 'discover' ? (selectedDiscover?.parking ?? null) : null
-          }
+          controlPoints={route?.controlPoints ?? null}
+          waypoints={route?.waypoints ?? null}
           mode={mapMode}
           onPickStart={onPickStart}
-          onDrawClick={tab === 'nearby' ? onDrawClick : undefined}
-          onDragHandle={tab === 'nearby' ? onDragHandle : undefined}
+          onDrawClick={onDrawClick}
+          onDragHandle={onDragHandle}
         />
       </main>
     </div>

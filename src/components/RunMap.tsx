@@ -22,7 +22,6 @@ type Props = {
   alternateRoutes?: LatLng[][] | null
   controlPoints?: LatLng[] | null
   waypoints?: LatLng[] | null
-  parking?: LatLng | null
   mode?: 'pick-start' | 'draw' | 'view'
   onPickStart?: (point: LatLng) => void
   onDrawClick?: (point: LatLng) => void
@@ -40,7 +39,6 @@ export function RunMap({
   alternateRoutes,
   controlPoints,
   waypoints,
-  parking,
   mode = 'pick-start',
   onPickStart,
   onDrawClick,
@@ -49,7 +47,6 @@ export function RunMap({
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<Map | null>(null)
   const markerRef = useRef<Marker | null>(null)
-  const parkingMarkerRef = useRef<Marker | null>(null)
   const handleMarkersRef = useRef<Marker[]>([])
   const waypointMarkersRef = useRef<Marker[]>([])
   const modeRef = useRef(mode)
@@ -141,7 +138,6 @@ export function RunMap({
       window.removeEventListener('orientationchange', resizeMap)
       ro?.disconnect()
       markerRef.current?.remove()
-      parkingMarkerRef.current?.remove()
       for (const m of handleMarkersRef.current) m.remove()
       for (const m of waypointMarkersRef.current) m.remove()
       handleMarkersRef.current = []
@@ -169,28 +165,6 @@ export function RunMap({
       map.easeTo({ center: [start.lng, start.lat], zoom: Math.max(map.getZoom(), 13) })
     }
   }, [start, route])
-
-  useEffect(() => {
-    const map = mapRef.current
-    if (!map) return
-
-    if (!parking) {
-      parkingMarkerRef.current?.remove()
-      parkingMarkerRef.current = null
-      return
-    }
-
-    if (!parkingMarkerRef.current) {
-      const el = document.createElement('div')
-      el.className = 'parking-marker'
-      el.title = 'Parking'
-      parkingMarkerRef.current = new Marker({ element: el })
-        .setLngLat([parking.lng, parking.lat])
-        .addTo(map)
-    } else {
-      parkingMarkerRef.current.setLngLat([parking.lng, parking.lat])
-    }
-  }, [parking])
 
   useEffect(() => {
     const map = mapRef.current

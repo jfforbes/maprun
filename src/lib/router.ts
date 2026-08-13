@@ -97,6 +97,8 @@ type PlannedBundle = {
   graph: RunGraph
   start: LatLng
   options: PlannedOption[]
+  leftover: RankedCandidate[]
+  minDistanceMiles: number
 }
 
 type DijkstraFn = (
@@ -129,10 +131,7 @@ let activeSession: RouteSession | null = null
 let manualDraw: ManualDrawState | null = null
 let plannedBundle: PlannedBundle | null = null
 
-export type RoutingSnapshot = {
-  session: RouteSession
-  planned: PlannedBundle | null
-}
+const MAX_ROUTE_OPTIONS = 9
 
 export function getActiveSession(): RouteSession | null {
   return activeSession
@@ -146,22 +145,12 @@ export function clearPlannedRoutes(): void {
   plannedBundle = null
 }
 
-export function snapshotRoutingState(): RoutingSnapshot | null {
-  if (!activeSession) return null
-  return {
-    session: {
-      ...activeSession,
-      nodePath: [...activeSession.nodePath],
-      controlIndexes: [...activeSession.controlIndexes],
-    },
-    planned: plannedBundle,
-  }
-}
-
-export function restoreRoutingState(snap: RoutingSnapshot): void {
-  manualDraw = null
-  activeSession = snap.session
-  plannedBundle = snap.planned
+export function hasMorePlannedRoutes(): boolean {
+  return Boolean(
+    plannedBundle &&
+      plannedBundle.leftover.length > 0 &&
+      plannedBundle.options.length < MAX_ROUTE_OPTIONS,
+  )
 }
 
 /** Switch the active auto-route option (updates edit session). */
@@ -480,6 +469,13 @@ function edgeOverlapRatio(a: Set<string>, b: Set<string>): number {
   return union === 0 ? 1 : inter / union
 }
 
+function similarToAny(candidate: RouteCandidate, used: RouteCandidate[]): boolean {
+  const edges = collectEdgeKeys(candidate.path)
+  return used.some(
+    (u) => edgeOverlapRatio(edges, collectEdgeKeys(u.path)) > 0.55,
+  )
+}
+
 function pathFingerprint(path: number[]): string {
   if (path.length <= 24) return path.join(',')
   const step = Math.max(1, Math.floor(path.length / 20))
@@ -493,77 +489,68 @@ function pickDiverseCandidates(
   ranked: RankedCandidate[],
   count: number,
   minDistanceMiles: number,
+  exclude: RouteCandidate[] = [],
 ): RouteCandidate[] {
   const eligible = ranked
     .map((r) => r.candidate)
     .filter((c) => displayMiles(c.lengthM) >= minDistanceMiles)
 
-  if (eligible.length === 0) {
-    const soft = ranked
-      .slice()
-      .sort((a, b) => b.score - a.score)
-      .map((r) => r.candidate)
-    return soft.slice(0, count)
-  }
-
   const tooSimilar = (a: RouteCandidate, b: RouteCandidate) =>
-    edgeOverlapRatio(collectEdgeKeys(a.path), collectEdgeKeys(b.path)) > 0.5
+    edgeOverlapRatio(collectEdgeKeys(a.path), collectEdgeKeys(b.path)) > 0.55
 
   const alreadyPicked = (c: RouteCandidate, picked: RouteCandidate[]) =>
     picked.some((p) => tooSimilar(p, c))
 
-  const picked: RouteCandidate[] = []
+  const picked: RouteCandidate[] = [...exclude]
+  const want = exclude.length + count
+  const room = () => picked.length < want
 
-  // 1) Flattest — climb first, even if it has lights
-  const byClimb = [...eligible].sort(
-    (a, b) =>
-      a.elevGainM - b.elevGainM ||
-      a.signals - b.signals ||
-      a.turns - b.turns ||
-      a.crossings - b.crossings,
-  )
-  if (byClimb[0]) picked.push(byClimb[0])
-
-  // 2) Quietest — fewer lights is fine even with more climb
-  if (picked.length < count) {
-    const byLights = [...eligible].sort(
+  if (exclude.length === 0) {
+    const byClimb = [...eligible].sort(
       (a, b) =>
-        a.signals - b.signals ||
         a.elevGainM - b.elevGainM ||
+        a.signals - b.signals ||
         a.turns - b.turns ||
         a.crossings - b.crossings,
     )
-    const quiet = byLights.find((c) => !alreadyPicked(c, picked))
-    if (quiet) picked.push(quiet)
-  }
+    if (byClimb[0]) picked.push(byClimb[0])
 
-  // 3) Fewest sharp turns — another tradeoff axis
-  if (picked.length < count) {
-    const byTurns = [...eligible].sort(
-      (a, b) =>
-        a.turns - b.turns ||
-        a.elevGainM - b.elevGainM ||
-        a.signals - b.signals ||
-        a.crossings - b.crossings,
-    )
-    const smooth = byTurns.find((c) => !alreadyPicked(c, picked))
-    if (smooth) picked.push(smooth)
-  }
+    if (room()) {
+      const byLights = [...eligible].sort(
+        (a, b) =>
+          a.signals - b.signals ||
+          a.elevGainM - b.elevGainM ||
+          a.turns - b.turns ||
+          a.crossings - b.crossings,
+      )
+      const quiet = byLights.find((c) => !alreadyPicked(c, picked))
+      if (quiet) picked.push(quiet)
+    }
 
-  // Fill remaining with next-best score / geographic diversity
-  if (picked.length < count) {
-    const byScore = [...ranked]
-      .sort((a, b) => b.score - a.score)
-      .map((r) => r.candidate)
-      .filter((c) => displayMiles(c.lengthM) >= minDistanceMiles)
-    for (const c of byScore) {
-      if (picked.length >= count) break
-      if (alreadyPicked(c, picked)) continue
-      picked.push(c)
+    if (room()) {
+      const byTurns = [...eligible].sort(
+        (a, b) =>
+          a.turns - b.turns ||
+          a.elevGainM - b.elevGainM ||
+          a.signals - b.signals ||
+          a.crossings - b.crossings,
+      )
+      const smooth = byTurns.find((c) => !alreadyPicked(c, picked))
+      if (smooth) picked.push(smooth)
     }
   }
 
-  return picked.slice(0, count)
+  const byScore = [...ranked]
+    .sort((a, b) => b.score - a.score)
+    .map((r) => r.candidate)
+    .filter((c) => displayMiles(c.lengthM) >= minDistanceMiles)
+  for (const c of byScore) {
+    if (!room()) break
+    if (alreadyPicked(c, picked)) continue
+    picked.push(c)
+  }
+
+  return picked.slice(exclude.length, want)
 }
 
 function optionBlurb(picked: RouteCandidate[], index: number): string {
@@ -671,7 +658,7 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
   const minM = milesToMeters(req.distanceMiles)
   const maxM = milesToMeters(req.distanceMiles + req.varianceMiles)
   const maxClimbM = req.maxClimbFeet / 3.28084
-  const optionCount = Math.max(1, Math.min(5, req.optionCount ?? 3))
+  const optionCount = Math.max(1, Math.min(9, req.optionCount ?? 3))
 
   const radiusM = Math.min(5000, Math.max(1100, minM * 0.7))
 
@@ -926,7 +913,15 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
     }
   })
 
-  plannedBundle = { graph, start: req.start, options }
+  const used = options.map((o) => o.candidate)
+
+  plannedBundle = {
+    graph,
+    start: req.start,
+    options,
+    leftover: ranked.filter((r) => !similarToAny(r.candidate, used)),
+    minDistanceMiles: req.distanceMiles,
+  }
   activeSession = {
     graph,
     nodePath: options[0].candidate.path,
@@ -937,6 +932,68 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
 
   return {
     routes: options.map((o) => o.result),
+    selectedIndex: 0,
+  }
+}
+
+/** Finalize a few more distinct auto-route options from leftover candidates. */
+export async function morePlannedRoutes(
+  extraCount = 2,
+): Promise<PlanRunResult> {
+  const bundle = plannedBundle
+  if (!bundle) throw new Error('No auto-route to expand. Route a run first.')
+
+  const room = MAX_ROUTE_OPTIONS - bundle.options.length
+  if (room <= 0 || bundle.leftover.length === 0) {
+    return {
+      routes: bundle.options.map((o) => o.result),
+      selectedIndex: 0,
+    }
+  }
+
+  const used = bundle.options.map((o) => o.candidate)
+  const next = pickDiverseCandidates(
+    bundle.leftover,
+    Math.min(extraCount, room),
+    bundle.minDistanceMiles,
+    used,
+  )
+
+  for (const candidate of next) {
+    try {
+      const built = await buildRouteResult(
+        bundle.graph,
+        candidate,
+        bundle.minDistanceMiles,
+      )
+      bundle.options.push({
+        candidate,
+        result: {
+          ...built.result,
+          optionLabel: 'Alternate',
+        },
+        controlIndexes: built.controlIndexes,
+      })
+    } catch {
+      // skip
+    }
+  }
+
+  const usedNow = bundle.options.map((o) => o.candidate)
+  bundle.leftover = bundle.leftover.filter(
+    (r) => !similarToAny(r.candidate, usedNow),
+  )
+
+  const all = bundle.options.map((o) => o.candidate)
+  bundle.options.forEach((opt, i) => {
+    opt.result = {
+      ...opt.result,
+      optionLabel: optionBlurb(all, i),
+    }
+  })
+
+  return {
+    routes: bundle.options.map((o) => o.result),
     selectedIndex: 0,
   }
 }
