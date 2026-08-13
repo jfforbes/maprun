@@ -179,7 +179,7 @@ export function DiscoverPanel({
           </em>
         </label>
 
-        <div className="field-row">
+        <div className="field-grid">
           <label className="field">
             <span>Drive radius (mi)</span>
             <input
@@ -209,9 +209,6 @@ export function DiscoverPanel({
               }
             />
           </label>
-        </div>
-
-        <div className="field-row">
           <label className="field">
             <span>Variance (mi)</span>
             <input

@@ -50,7 +50,7 @@ input {
 
 .app-shell {
   display: grid;
-  grid-template-columns: minmax(0, 400px) minmax(0, 1fr);
+  grid-template-columns: 22.5rem minmax(0, 1fr);
   height: 100%;
   min-height: 100dvh;
   max-height: 100dvh;
@@ -156,6 +156,12 @@ input {
   display: flex;
   flex-direction: column;
   gap: 0.9rem;
+  width: 100%;
+  min-width: 0;
+}
+
+.route-form > .btn {
+  width: 100%;
 }
 
 .field {
@@ -171,10 +177,12 @@ input {
   letter-spacing: 0.04em;
   text-transform: uppercase;
   color: var(--muted);
+  overflow-wrap: anywhere;
 }
 
 .field input {
   width: 100%;
+  max-width: 100%;
   min-width: 0;
   border: 1px solid var(--line);
   border-radius: 12px;
@@ -184,6 +192,17 @@ input {
   outline: none;
   font-size: 1rem;
   transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.field input[type='number'] {
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+
+.field input[type='number']::-webkit-outer-spin-button,
+.field input[type='number']::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }
 
 .field input:focus {
@@ -201,6 +220,8 @@ input {
 
 .autocomplete {
   position: relative;
+  width: 100%;
+  min-width: 0;
 }
 
 .autocomplete-status {
@@ -248,10 +269,12 @@ input {
   background: color-mix(in srgb, var(--accent) 12%, white);
 }
 
-.field-row {
+.field-row,
+.field-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 0.75rem;
+  width: 100%;
   min-width: 0;
 }
 
