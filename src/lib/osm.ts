@@ -92,34 +92,48 @@ function coordKey(lat: number, lng: number): string {
   return `${lat.toFixed(6)},${lng.toFixed(6)}`
 }
 
+function isRunnableWay(tags: Record<string, string>): boolean {
+  if (tags.foot === 'no' || tags.foot === 'private') return false
+  if (tags.access === 'no' || tags.access === 'private' || tags.access === 'customers') {
+    if (tags.foot !== 'yes' && tags.foot !== 'designated') return false
+  }
+  if (tags.highway === 'service') {
+    const service = tags.service ?? ''
+    if (
+      service === 'parking_aisle' ||
+      service === 'driveway' ||
+      service === 'parking'
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
 export async function fetchOsmNetwork(
   center: LatLng,
   radiusM: number,
 ): Promise<OsmNetwork> {
   const r = Math.ceil(Math.min(radiusM, 3500))
 
-  const waysQuery = `
-[out:json][timeout:50];
-way["highway"~"${WALKABLE}"]["area"!~"yes"](around:${r},${center.lat},${center.lng});
+  const query = `
+[out:json][timeout:55];
+way["highway"~"${WALKABLE}"]["area"!~"yes"]["foot"!="no"]["access"!="no"]["access"!="private"](around:${r},${center.lat},${center.lng});
 out geom;
-`.trim()
-
-  const hazardsQuery = `
-[out:json][timeout:25];
 (
   node["highway"="traffic_signals"](around:${r},${center.lat},${center.lng});
   node["crossing"="traffic_signals"](around:${r},${center.lat},${center.lng});
   node["traffic_signals"](around:${r},${center.lat},${center.lng});
+  node["crossing:signals"="yes"](around:${r},${center.lat},${center.lng});
+  node["flashing_lights"="yes"](around:${r},${center.lat},${center.lng});
   node["highway"="crossing"](around:${r},${center.lat},${center.lng});
 );
 out body;
 `.trim()
 
-  const [wayElements, hazardElements] = await Promise.all([
-    overpassQuery(waysQuery),
-    overpassQuery(hazardsQuery).catch(() => [] as OverpassElement[]),
-  ])
-
+  const elements = await overpassQuery(query)
+  const wayElements = elements.filter((el) => el.type === 'way')
+  const hazardElements = elements.filter((el) => el.type === 'node')
   return parseNetwork(wayElements, hazardElements)
 }
 
@@ -152,11 +166,13 @@ function parseNetwork(
 
   for (const el of wayElements) {
     if (el.type !== 'way' || !el.geometry || el.geometry.length < 2) continue
+    const tags = el.tags ?? {}
+    if (!isRunnableWay(tags)) continue
     const nodeIds = el.geometry.map((g) => getOrCreateNode(g.lat, g.lon))
     ways.push({
       id: el.id,
       nodeIds,
-      highway: el.tags?.highway ?? 'road',
+      highway: tags.highway ?? 'road',
     })
   }
 
@@ -178,10 +194,15 @@ function parseNetwork(
     if (el.type !== 'node') continue
     const point = { lat: el.lat, lng: el.lon }
     const tags = el.tags ?? {}
+    const isRampMeter = tags.traffic_signals === 'ramp_meter'
     const isSignal =
-      tags.highway === 'traffic_signals' ||
-      tags.crossing === 'traffic_signals' ||
-      tags.traffic_signals !== undefined
+      !isRampMeter &&
+      (tags.highway === 'traffic_signals' ||
+        tags.crossing === 'traffic_signals' ||
+        tags['crossing:signals'] === 'yes' ||
+        tags.flashing_lights === 'yes' ||
+        (tags.traffic_signals !== undefined &&
+          tags.traffic_signals !== 'ramp_meter'))
     if (isSignal) {
       markNear(point, 'isSignal', signals)
     }

@@ -8,6 +8,7 @@ import {
   haversineMeters,
   metersToFeet,
   milesToMeters,
+  pathCompactness,
   pathLengthMeters,
   turnAngleDegrees,
   type LatLng,
@@ -273,7 +274,7 @@ function scoreRoute(
   const lengthScore = inRange
     ? -Math.abs(stats.lengthM - lengthTarget) / 500
     : -Math.abs(stats.lengthM - lengthTarget) / 40
-  const loopBonus = stats.kind === 'loop' ? 5 : 0
+  const loopBonus = stats.kind === 'loop' ? 40 : 0
 
   // Near-lexicographic preference once distance works:
   // climb >> lights >> turns >> crossings
@@ -309,32 +310,55 @@ function summarizePath(
   parts: DijkstraResult[],
   kind: RouteKind = 'loop',
 ): RouteCandidate {
-  const path = mergePaths(parts.map((p) => p.path))
-  const hazards = hazardsForCandidate(graph, path)
-  return {
-    kind,
-    path,
-    lengthM: parts.reduce((s, p) => s + p.lengthM, 0),
-    elevGainM: parts.reduce((s, p) => s + p.elevGainM, 0),
-    elevLossM: parts.reduce((s, p) => s + p.elevLossM, 0),
-    signals: hazards.signals,
-    crossings: hazards.crossings,
-    turns: parts.reduce((s, p) => s + p.turns, 0),
+  let path = mergePaths(parts.map((p) => p.path))
+  if (kind === 'loop') path = pruneRetraceSpikes(path)
+  if (path.length < 4) {
+    return {
+      kind,
+      path,
+      lengthM: 0,
+      elevGainM: 0,
+      elevLossM: 0,
+      signals: 0,
+      crossings: 0,
+      turns: 0,
+    }
   }
+  return candidateFromNodePath(graph, path, kind)
+}
+
+/** Remove A→B→A spikes (mid-block turnarounds that pad distance). */
+function pruneRetraceSpikes(path: number[]): number[] {
+  const stack: number[] = []
+  for (const id of path) {
+    if (stack.length >= 1 && stack[stack.length - 1] === id) continue
+    if (stack.length >= 2 && stack[stack.length - 2] === id) {
+      stack.pop()
+      continue
+    }
+    stack.push(id)
+  }
+  return stack
 }
 
 function findNearbyNodes(
   graph: RunGraph,
   target: LatLng,
   limit = 8,
+  minDegree = 1,
 ): number[] {
-  const scored: { id: number; d: number }[] = []
-  for (const [id, pos] of graph.nodePos) {
-    const d = haversineMeters(target, pos)
-    if (d < 700) scored.push({ id, d })
+  const collect = (degree: number) => {
+    const scored: { id: number; d: number }[] = []
+    for (const [id, pos] of graph.nodePos) {
+      if (degree > 1 && (graph.adj.get(id)?.length ?? 0) < degree) continue
+      const d = haversineMeters(target, pos)
+      if (d < 700) scored.push({ id, d })
+    }
+    scored.sort((a, b) => a.d - b.d)
+    return scored.slice(0, limit).map((s) => s.id)
   }
-  scored.sort((a, b) => a.d - b.d)
-  return scored.slice(0, limit).map((s) => s.id)
+  const preferred = collect(minDegree)
+  return preferred.length ? preferred : collect(1)
 }
 
 function elevAlongPath(
@@ -393,10 +417,10 @@ function tryTwoLegLoop(
 
   const avoid = collectEdgeKeys(out.path)
   const back = findPath(graph, farId, startId, weights, avoid)
-  if (!back || back.path.length < 2) {
-    return tryOutAndBack(graph, startId, farId, weights, findPath)
-  }
-  return summarizePath(graph, [out, back], 'loop')
+  if (!back || back.path.length < 2) return null
+  const loop = summarizePath(graph, [out, back], 'loop')
+  if (loopRetraceRatio(loop.path) > 0.02) return null
+  return loop
 }
 
 function tryThreeLegLoop(
@@ -414,12 +438,10 @@ function tryThreeLegLoop(
   if (!leg2) return null
   const avoid2 = new Set([...avoid1, ...collectEdgeKeys(leg2.path)])
   const leg3 = findPath(graph, bId, startId, weights, avoid2)
-  if (!leg3) {
-    const leg3Any = findPath(graph, bId, startId, weights)
-    if (!leg3Any) return null
-    return summarizePath(graph, [leg1, leg2, leg3Any], 'loop')
-  }
-  return summarizePath(graph, [leg1, leg2, leg3], 'loop')
+  if (!leg3) return null
+  const loop = summarizePath(graph, [leg1, leg2, leg3], 'loop')
+  if (loopRetraceRatio(loop.path) > 0.02) return null
+  return loop
 }
 
 async function elevationsForNetwork(
@@ -451,13 +473,17 @@ async function elevationsForNetwork(
     const elevs = await fetchElevationsSoft(samplePts)
     sampleIds.forEach((id, i) => elevMap.set(id, elevs[i] ?? 0))
     for (let i = 0; i < ids.length; i++) {
-      if (!elevMap.has(ids[i])) {
-        const nearestSample = Math.min(
-          sampleIds.length - 1,
-          Math.round(i / step),
-        )
-        elevMap.set(ids[i], elevMap.get(sampleIds[nearestSample]) ?? 0)
+      if (elevMap.has(ids[i])) continue
+      let nearest = 0
+      let nearestD = Infinity
+      for (let s = 0; s < samplePts.length; s++) {
+        const d = haversineMeters(points[i], samplePts[s])
+        if (d < nearestD) {
+          nearestD = d
+          nearest = s
+        }
       }
+      elevMap.set(ids[i], elevs[nearest] ?? 0)
     }
   }
   return elevMap
@@ -541,6 +567,42 @@ function edgeOverlapRatio(a: Set<string>, b: Set<string>): number {
   }
   const union = a.size + b.size - inter
   return union === 0 ? 1 : inter / union
+}
+
+function loopRetraceRatio(path: number[]): number {
+  const seen = new Set<string>()
+  let reuse = 0
+  for (let i = 1; i < path.length; i++) {
+    const key = `${Math.min(path[i - 1], path[i])}-${Math.max(path[i - 1], path[i])}`
+    if (seen.has(key)) reuse += 1
+    else seen.add(key)
+  }
+  return seen.size === 0 ? 0 : reuse / seen.size
+}
+
+function pathServiceRatio(graph: RunGraph, path: number[]): number {
+  let serviceM = 0
+  let totalM = 0
+  for (let i = 0; i < path.length - 1; i++) {
+    const edge = (graph.adj.get(path[i]) ?? []).find((e) => e.to === path[i + 1])
+    if (!edge) continue
+    totalM += edge.lengthM
+    if (edge.highway === 'service') serviceM += edge.lengthM
+  }
+  return totalM > 0 ? serviceM / totalM : 0
+}
+
+/** Drop skinny lollipops, parking-lot crawls, and hyper-jagged traces. */
+function isPoorRun(graph: RunGraph, candidate: RouteCandidate): boolean {
+  const km = candidate.lengthM / 1000
+  if (km > 0.4 && candidate.turns / km > 10) return true
+  if (pathServiceRatio(graph, candidate.path) > 0.22) return true
+  if (candidate.kind === 'loop') {
+    if (loopRetraceRatio(candidate.path) > 0.02) return true
+    const compact = pathCompactness(pathToLatLng(graph, candidate.path))
+    if (compact < 0.1) return true
+  }
+  return false
 }
 
 function similarToAny(candidate: RouteCandidate, used: RouteCandidate[]): boolean {
@@ -763,30 +825,32 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
   )
 
   const outAndBackRadii = [minM * 0.45, minM * 0.5, minM * 0.55]
-  const loopRadii = [minM * 0.42, minM * 0.5, maxM / (2 * Math.PI) * 1.2]
+  // Far-point distance for a round loop is ~circumference / 2π, not ~half the run.
+  const roundR = minM / (2 * Math.PI)
+  const loopRadii = [roundR, minM * 0.22, minM * 0.3]
 
   const bearings: number[] = []
   for (let b = 0; b < 360; b += 30) bearings.push(b)
 
   const weightSets: PathCostWeights[] = [
-    // Climb-first: willing to take a light to stay flatter
+    // Climb-first, but still keep the line runnable
     {
-      elevGainPenalty: 200,
+      elevGainPenalty: 90,
       signalPenalty: allowLights ? 0 : 60,
-      turnPenalty: 25,
+      turnPenalty: 55,
       crossingPenalty: 4,
     },
-    // Balanced quiet + climb
+    // Balanced
     {
       ...DEFAULT_WEIGHTS,
       signalPenalty: allowLights ? 0 : DEFAULT_WEIGHTS.signalPenalty,
     },
-    // Quiet-first (or turns-first when lights are allowed)
+    // Smooth / quiet
     {
-      elevGainPenalty: 70,
+      elevGainPenalty: 40,
       signalPenalty: allowLights ? 0 : 900,
-      turnPenalty: allowLights ? 55 : 45,
-      crossingPenalty: 10,
+      turnPenalty: allowLights ? 120 : 100,
+      crossingPenalty: 8,
     },
   ]
 
@@ -809,6 +873,7 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
     candidate: RouteCandidate | null,
     scoreMaxM = maxM,
     scoreClimb = maxClimbM,
+    stretch = false,
   ) => {
     if (!candidate || candidate.path.length < 3) return
     const gap =
@@ -818,6 +883,11 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
     if (gap < search.closestGap) {
       search.closestGap = gap
       search.closest = candidate
+    }
+    if (!stretch) {
+      const miles = displayMiles(candidate.lengthM)
+      if (miles > req.distanceMiles + req.varianceMiles + 0.3) return
+      if (isPoorRun(graph, candidate)) return
     }
     const s = scoreRoute(
       { ...candidate, kind: candidate.kind },
@@ -845,20 +915,22 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
   let attempts = 0
 
   // Pass 1: loops first (two-leg + triangle)
-  for (const weights of weightSets) {
+  for (let wi = 0; wi < weightSets.length; wi++) {
+    const weights = weightSets[wi]
+    if (!weights) continue
     for (const bearing of bearings) {
       if (++attempts % 6 === 0) await yieldToUi()
       for (const radius of loopRadii) {
         const farPoint = destinationPoint(req.start, bearing, radius)
-        for (const farId of findNearbyNodes(graph, farPoint, 2)) {
+        for (const farId of findNearbyNodes(graph, farPoint, 3, 3)) {
           if (farId === startId) continue
           consider(tryTwoLegLoop(graph, startId, farId, weights, findPath))
         }
 
         const aPoint = destinationPoint(req.start, bearing, radius)
-        const bPoint = destinationPoint(req.start, bearing + 100, radius * 0.95)
-        const aIds = findNearbyNodes(graph, aPoint, 2)
-        const bIds = findNearbyNodes(graph, bPoint, 2)
+        const bPoint = destinationPoint(req.start, bearing + 120, radius * 0.95)
+        const aIds = findNearbyNodes(graph, aPoint, 2, 3)
+        const bIds = findNearbyNodes(graph, bPoint, 2, 3)
         for (const aId of aIds) {
           for (const bId of bIds) {
             if (aId === startId || bId === startId || aId === bId) continue
@@ -868,6 +940,7 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
       }
     }
     if (
+      wi >= 1 &&
       hasEnoughOptions() &&
       search.best &&
       search.best.kind === 'loop' &&
@@ -912,25 +985,29 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
   if (!search.best || displayMiles(search.best.lengthM) < req.distanceMiles) {
     status('Stretching the route to meet distance…')
     const softWeights: PathCostWeights = {
-      turnPenalty: 25,
+      turnPenalty: 70,
       signalPenalty: allowLights ? 0 : 80,
       crossingPenalty: 5,
-      elevGainPenalty: 160,
+      elevGainPenalty: 50,
     }
     for (let bearing = 0; bearing < 360; bearing += 20) {
-      for (const factor of [0.48, 0.55, 0.62]) {
+      for (const factor of [0.2, 0.28, 0.48, 0.55]) {
         const farPoint = destinationPoint(req.start, bearing, minM * factor)
         for (const farId of findNearbyNodes(graph, farPoint, 3)) {
           consider(
             tryTwoLegLoop(graph, startId, farId, softWeights, findPath),
             maxM * 1.25,
             maxClimbM * 1.4,
+            true,
           )
-          consider(
-            tryOutAndBack(graph, startId, farId, softWeights, findPath),
-            maxM * 1.25,
-            maxClimbM * 1.4,
-          )
+          if (factor >= 0.45) {
+            consider(
+              tryOutAndBack(graph, startId, farId, softWeights, findPath),
+              maxM * 1.25,
+              maxClimbM * 1.4,
+              true,
+            )
+          }
         }
       }
     }

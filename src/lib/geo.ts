@@ -82,6 +82,31 @@ export function pathLengthMeters(points: LatLng[]): number {
   return total
 }
 
+/** 1 = circle, ~0 = out-and-back line. Uses the closed polygon of the polyline. */
+export function pathCompactness(points: LatLng[]): number {
+  if (points.length < 4) return 0
+  const peri = pathLengthMeters(points)
+  if (peri < 1) return 0
+  const first = points[0]
+  const last = points[points.length - 1]
+  const closed =
+    haversineMeters(first, last) < 40 ? points : [...points, first]
+  const lat0 = first.lat
+  const mPerDegLat = 111_320
+  const mPerDegLng = 111_320 * Math.cos(toRad(lat0))
+  let area2 = 0
+  for (let i = 0; i < closed.length; i++) {
+    const j = (i + 1) % closed.length
+    const xi = closed[i].lng * mPerDegLng
+    const yi = closed[i].lat * mPerDegLat
+    const xj = closed[j].lng * mPerDegLng
+    const yj = closed[j].lat * mPerDegLat
+    area2 += xi * yj - xj * yi
+  }
+  const area = Math.abs(area2) / 2
+  return Math.min(1, (4 * Math.PI * area) / (peri * peri))
+}
+
 export function elevationGainFeet(elevationsM: number[]): number {
   let gain = 0
   for (let i = 1; i < elevationsM.length; i++) {

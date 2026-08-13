@@ -18,6 +18,7 @@ export type GraphEdge = {
   /** True when arriving at a crossing node */
   entersCrossing: boolean
   highway: string
+  wayId: number
 }
 
 export type RunGraph = {
@@ -26,23 +27,25 @@ export type RunGraph = {
   elevations: Map<number, number>
   signalNodes: Set<number>
   crossingNodes: Set<number>
+  /** One point per signalized intersection (nearby OSM nodes clustered). */
+  signalClusters: LatLng[]
 }
 
 const FOOT_PREF: Record<string, number> = {
-  footway: 0.85,
-  path: 0.9,
-  pedestrian: 0.85,
-  living_street: 0.95,
+  footway: 0.82,
+  path: 0.86,
+  pedestrian: 0.82,
+  living_street: 0.92,
+  cycleway: 0.9,
   residential: 1,
-  cycleway: 0.95,
-  track: 1.05,
-  bridleway: 1.05,
-  unclassified: 1.1,
-  service: 1.15,
-  tertiary: 1.2,
-  secondary: 1.35,
-  primary: 1.5,
-  steps: 1.8,
+  track: 1.02,
+  bridleway: 1.08,
+  unclassified: 1.08,
+  tertiary: 1.15,
+  service: 1.55,
+  secondary: 1.42,
+  primary: 1.65,
+  steps: 2.2,
 }
 
 export function buildGraph(
@@ -94,6 +97,7 @@ export function buildGraph(
         entersSignal: signalNodes.has(bId),
         entersCrossing: crossingNodes.has(bId),
         highway: way.highway,
+        wayId: way.id,
       })
       addEdge(bId, {
         to: aId,
@@ -104,11 +108,54 @@ export function buildGraph(
         entersSignal: signalNodes.has(aId),
         entersCrossing: crossingNodes.has(aId),
         highway: way.highway,
+        wayId: way.id,
       })
     }
   }
 
-  return { adj, nodePos, elevations, signalNodes, crossingNodes }
+  inferBusyIntersections(adj, signalNodes)
+
+  return {
+    adj,
+    nodePos,
+    elevations,
+    signalNodes,
+    crossingNodes,
+    signalClusters: clusterPoints(
+      [
+        ...network.signals,
+        ...[...signalNodes]
+          .map((id) => nodePos.get(id))
+          .filter((p): p is LatLng => Boolean(p)),
+      ],
+      55,
+    ),
+  }
+}
+
+const BUSY_ROAD = new Set(['tertiary', 'secondary', 'primary'])
+
+/** OSM often skips lights at bigger intersections. Treat busy crosses as signals. */
+function inferBusyIntersections(
+  adj: Map<number, GraphEdge[]>,
+  signalNodes: Set<number>,
+): void {
+  for (const [id, edges] of adj) {
+    if (signalNodes.has(id) || edges.length < 4) continue
+    const busyWays = new Set(
+      edges.filter((e) => BUSY_ROAD.has(e.highway)).map((e) => e.wayId),
+    )
+    if (busyWays.size >= 2) signalNodes.add(id)
+  }
+}
+
+function clusterPoints(points: LatLng[], radiusM: number): LatLng[] {
+  const clusters: LatLng[] = []
+  for (const p of points) {
+    if (clusters.some((c) => haversineMeters(c, p) <= radiusM)) continue
+    clusters.push(p)
+  }
+  return clusters
 }
 
 export type PathCostWeights = {
@@ -121,10 +168,11 @@ export type PathCostWeights = {
 }
 
 export const DEFAULT_WEIGHTS: PathCostWeights = {
-  // Prefer flatter paths; lights are secondary (options can trade them off)
-  elevGainPenalty: 140,
+  // Climb still matters, but not enough to snake around the block.
+  // Ranking (not these weights) keeps climb as the #1 pick among options.
+  elevGainPenalty: 55,
   signalPenalty: 120,
-  turnPenalty: 30,
+  turnPenalty: 80,
   crossingPenalty: 5,
 }
 
@@ -226,6 +274,8 @@ export function dijkstra(
 
   type State = {
     id: number
+    from: number | null
+    wayId: number | null
     cost: number
     lengthM: number
     elevGainM: number
@@ -236,13 +286,19 @@ export function dijkstra(
     bearing: number | null
   }
 
-  const best = new Map<number, number>()
-  const prev = new Map<number, number | null>()
-  const meta = new Map<number, Omit<State, 'id' | 'cost'>>()
+  const stateKey = (id: number, from: number | null) =>
+    weights.shortestPath ? String(id) : `${from ?? '*'}>${id}`
+
+  const best = new Map<string, number>()
+  const prev = new Map<string, string | null>()
+  const meta = new Map<string, Omit<State, 'cost'>>()
   const heap = new MinHeap<State>((s) => s.cost)
 
+  const startKey = stateKey(startId, null)
   heap.push({
     id: startId,
+    from: null,
+    wayId: null,
     cost: 0,
     lengthM: 0,
     elevGainM: 0,
@@ -252,9 +308,12 @@ export function dijkstra(
     turns: 0,
     bearing: null,
   })
-  best.set(startId, 0)
-  prev.set(startId, null)
-  meta.set(startId, {
+  best.set(startKey, 0)
+  prev.set(startKey, null)
+  meta.set(startKey, {
+    id: startId,
+    from: null,
+    wayId: null,
     lengthM: 0,
     elevGainM: 0,
     elevLossM: 0,
@@ -264,10 +323,16 @@ export function dijkstra(
     bearing: null,
   })
 
+  let endKey: string | null = null
+
   while (heap.size) {
     const cur = heap.pop()!
-    if ((best.get(cur.id) ?? Infinity) < cur.cost - 1e-6) continue
-    if (cur.id === endId) break
+    const curKey = stateKey(cur.id, cur.from)
+    if ((best.get(curKey) ?? Infinity) < cur.cost - 1e-6) continue
+    if (cur.id === endId) {
+      endKey = curKey
+      break
+    }
 
     const edges = graph.adj.get(cur.id) ?? []
     for (const edge of edges) {
@@ -276,27 +341,35 @@ export function dijkstra(
 
       const highwayMul = weights.shortestPath
         ? 1
-        : (FOOT_PREF[edge.highway] ?? 1.2)
+        : (FOOT_PREF[edge.highway] ?? 1.25)
       let turn = 0
       let turnCount = 0
       if (cur.bearing !== null) {
         turn = turnAngleDegrees(cur.bearing, edge.bearing)
         if (turn > MIN_TURN_DEGREES) turnCount = 1
       }
+      const uTurn = cur.from === edge.to
 
       const stepCost = weights.shortestPath
         ? edge.lengthM
         : edge.lengthM * highwayMul +
-          // Only apply turn cost for real bends (>60°)
           (turn > MIN_TURN_DEGREES ? (turn / 90) * weights.turnPenalty : 0) +
+          (turn > 135 ? weights.turnPenalty * 1.5 : 0) +
+          (uTurn ? weights.turnPenalty * 4 : 0) +
+          (cur.wayId !== null && cur.wayId !== edge.wayId ? 16 : 0) +
           (edge.entersSignal ? weights.signalPenalty : 0) +
           (edge.entersCrossing ? weights.crossingPenalty : 0) +
           edge.elevGainM * weights.elevGainPenalty
 
       const nextCost = cur.cost + stepCost
-      if (nextCost + 1e-6 >= (best.get(edge.to) ?? Infinity)) continue
+      const nextFrom = weights.shortestPath ? null : cur.id
+      const nextKey = stateKey(edge.to, nextFrom)
+      if (nextCost + 1e-6 >= (best.get(nextKey) ?? Infinity)) continue
 
       const nextMeta = {
+        id: edge.to,
+        from: nextFrom,
+        wayId: edge.wayId,
         lengthM: cur.lengthM + edge.lengthM,
         elevGainM: cur.elevGainM + edge.elevGainM,
         elevLossM: cur.elevLossM + edge.elevLossM,
@@ -306,25 +379,26 @@ export function dijkstra(
         bearing: edge.bearing,
       }
 
-      best.set(edge.to, nextCost)
-      prev.set(edge.to, cur.id)
-      meta.set(edge.to, nextMeta)
+      best.set(nextKey, nextCost)
+      prev.set(nextKey, curKey)
+      meta.set(nextKey, nextMeta)
       heap.push({
-        id: edge.to,
         cost: nextCost,
         ...nextMeta,
       })
     }
   }
 
-  if (!prev.has(endId)) return null
-  const endMeta = meta.get(endId)
+  if (!endKey) return null
+  const endMeta = meta.get(endKey)
   if (!endMeta) return null
 
   const path: number[] = []
-  let walk: number | null = endId
+  let walk: string | null = endKey
   while (walk !== null) {
-    path.push(walk)
+    const node = meta.get(walk)
+    if (!node) break
+    path.push(node.id)
     walk = prev.get(walk) ?? null
   }
   path.reverse()
@@ -405,16 +479,21 @@ export function countPathHazards(
   graph: RunGraph,
   path: number[],
 ): { signals: number; crossings: number } {
-  let signals = 0
+  const hitSignals = new Set<number>()
+  const seenCross = new Set<number>()
   let crossings = 0
-  const seen = new Set<number>()
   for (const id of path) {
-    if (seen.has(id)) continue
-    seen.add(id)
-    if (graph.signalNodes.has(id)) signals += 1
+    const pos = graph.nodePos.get(id)
+    if (pos) {
+      graph.signalClusters.forEach((c, i) => {
+        if (haversineMeters(pos, c) <= 40) hitSignals.add(i)
+      })
+    }
+    if (seenCross.has(id)) continue
+    seenCross.add(id)
     if (graph.crossingNodes.has(id)) crossings += 1
   }
-  return { signals, crossings }
+  return { signals: hitSignals.size, crossings }
 }
 
 /** Soften repeated edge use when stitching loop legs */
