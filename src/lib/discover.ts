@@ -41,6 +41,44 @@ type ParkingSpot = {
   id: string
   label: string
   location: LatLng
+  kind: 'lot' | 'street'
+  named: boolean
+}
+
+const STREET_PARKING_KINDS = new Set([
+  'street_side',
+  'lane',
+  'on_kerb',
+  'layby',
+  'on_street',
+  'shoulder',
+])
+
+const STREET_LANE_YES =
+  /^(parallel|diagonal|perpendicular|marked|yes|parking)$/i
+const STREET_PARKING_YES = /^(lane|street_side|on_street|yes)$/i
+
+function parkingKindLabel(kind: string, streetName?: string): string {
+  if (streetName) return `Street parking · ${streetName}`
+  if (STREET_PARKING_KINDS.has(kind) || kind === 'street') return 'Street parking'
+  if (kind === 'park_and_ride') return 'Park & ride'
+  if (kind === 'surface' || kind === 'lot' || !kind) return 'Parking lot'
+  return 'Parking lot'
+}
+
+function hasStreetParkingTags(tags: Record<string, string>): boolean {
+  const keys = [
+    'parking:lane:both',
+    'parking:lane:left',
+    'parking:lane:right',
+  ]
+  for (const key of keys) {
+    if (STREET_LANE_YES.test(tags[key] ?? '')) return true
+  }
+  for (const key of ['parking:both', 'parking:left', 'parking:right']) {
+    if (STREET_PARKING_YES.test(tags[key] ?? '')) return true
+  }
+  return false
 }
 
 function placeCenter(el: OsmCenterEl): LatLng | null {
@@ -62,28 +100,46 @@ function bearingFrom(home: LatLng, point: LatLng): number {
 
 function parkingFromElement(el: OsmCenterEl): ParkingSpot | null {
   const tags = el.tags ?? {}
-  if (tags.amenity !== 'parking') return null
-
   const access = (tags.access ?? '').toLowerCase()
   if (['private', 'no', 'customers', 'permit'].includes(access)) return null
   if ((tags.parking ?? '').toLowerCase() === 'private') return null
 
-  const kind = (tags.parking ?? '').toLowerCase()
-  if (['garage', 'multi-storey', 'underground', 'rooftop'].includes(kind)) {
-    return null
-  }
-
   const center = placeCenter(el)
   if (!center) return null
 
+  const amenityKind = (tags.parking ?? '').toLowerCase()
+  if (['garage', 'multi-storey', 'underground', 'rooftop'].includes(amenityKind)) {
+    return null
+  }
+
+  const streetFromLane = hasStreetParkingTags(tags)
+  const isStreetAmenity =
+    tags.amenity === 'parking' && STREET_PARKING_KINDS.has(amenityKind)
+  const isLot = tags.amenity === 'parking' && !isStreetAmenity
+
+  if (!isLot && !isStreetAmenity && !streetFromLane) return null
+
+  const kind: 'lot' | 'street' =
+    isLot && !streetFromLane ? 'lot' : 'street'
+  const streetName =
+    kind === 'street'
+      ? tags.name?.trim() || tags['name:en']?.trim()
+      : undefined
+  const named = Boolean(
+    (kind === 'lot' && tags.name?.trim()) ||
+      (kind === 'street' && streetName),
+  )
   const label =
-    tags.name?.trim() ||
-    (kind ? `${kind.replace(/_/g, ' ')} parking` : 'Parking')
+    kind === 'lot'
+      ? tags.name?.trim() || parkingKindLabel(amenityKind || 'lot')
+      : parkingKindLabel(amenityKind || 'street', streetName)
 
   return {
     id: `${el.type}-${el.id}`,
     label,
     location: center,
+    kind,
+    named,
   }
 }
 
@@ -100,6 +156,12 @@ async function fetchParking(
 (
   node["amenity"="parking"](around:${r},${home.lat},${home.lng});
   way["amenity"="parking"](around:${r},${home.lat},${home.lng});
+  way["highway"]["name"]["parking:lane:both"~"^(parallel|diagonal|perpendicular|marked|yes)$"](around:${r},${home.lat},${home.lng});
+  way["highway"]["name"]["parking:lane:left"~"^(parallel|diagonal|perpendicular|marked|yes)$"](around:${r},${home.lat},${home.lng});
+  way["highway"]["name"]["parking:lane:right"~"^(parallel|diagonal|perpendicular|marked|yes)$"](around:${r},${home.lat},${home.lng});
+  way["highway"]["name"]["parking:both"~"^(lane|street_side|on_street)$"](around:${r},${home.lat},${home.lng});
+  way["highway"]["name"]["parking:left"~"^(lane|street_side|on_street)$"](around:${r},${home.lat},${home.lng});
+  way["highway"]["name"]["parking:right"~"^(lane|street_side|on_street)$"](around:${r},${home.lat},${home.lng});
 );
 out center tags;
 `.trim()
@@ -135,9 +197,7 @@ function pickSpreadHubs(
     })
     .filter((c) => c.driveM >= minDriveM && c.driveM <= radiusM)
     .sort((a, b) => {
-      const namedA = a.spot.label === 'Parking' ? 1 : 0
-      const namedB = b.spot.label === 'Parking' ? 1 : 0
-      if (namedA !== namedB) return namedA - namedB
+      if (a.spot.named !== b.spot.named) return a.spot.named ? -1 : 1
       return Math.abs(a.driveM - targetRing) - Math.abs(b.driveM - targetRing)
     })
 
@@ -145,11 +205,24 @@ function pickSpreadHubs(
   const sectorUsed = new Set<number>()
   const sectors = 8
 
+  const wantStreet = Math.min(
+    2,
+    candidates.filter((c) => c.spot.kind === 'street').length,
+  )
+
   for (const { spot } of candidates) {
     if (hubs.length >= maxHubs) break
     const sector = Math.floor(bearingFrom(home, spot.location) / (360 / sectors))
     if (sectorUsed.has(sector) && hubs.length < sectors) continue
     if (hubs.some((h) => haversineMeters(h.location, spot.location) < minSeparationM)) {
+      continue
+    }
+    const streetCount = hubs.filter((h) => h.kind === 'street').length
+    if (
+      spot.kind === 'lot' &&
+      streetCount < wantStreet &&
+      hubs.length >= maxHubs - (wantStreet - streetCount)
+    ) {
       continue
     }
     sectorUsed.add(sector)

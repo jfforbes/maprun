@@ -158,8 +158,8 @@ export function DiscoverPanel({
   return (
     <>
       <p className="brand-sub discover-lead">
-        Drive-to loops that start at parking. Ranked by climb, then lights,
-        turns, and crossings.
+        Drive-to loops from lots or street parking. Ranked by climb, then
+        lights, turns, and crossings.
       </p>
 
       <form className="route-form" onSubmit={onSubmit}>
