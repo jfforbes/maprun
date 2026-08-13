@@ -27,10 +27,12 @@ type Props = {
   onPickStart?: (point: LatLng) => void
   onDrawClick?: (point: LatLng) => void
   onDragHandle?: (handleIndex: number, point: LatLng) => void
+  onRouteClick?: (point: LatLng) => void
 }
 
 const ROUTE_SOURCE = 'run-route'
 const ROUTE_LAYER = 'run-route-line'
+const ROUTE_HIT = 'run-route-hit'
 const ALT_SOURCE = 'run-route-alts'
 const ALT_LAYER = 'run-route-alts-line'
 
@@ -45,6 +47,7 @@ export function RunMap({
   onPickStart,
   onDrawClick,
   onDragHandle,
+  onRouteClick,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<Map | null>(null)
@@ -56,10 +59,12 @@ export function RunMap({
   const onPickRef = useRef(onPickStart)
   const onDrawRef = useRef(onDrawClick)
   const onDragRef = useRef(onDragHandle)
+  const onRouteClickRef = useRef(onRouteClick)
   modeRef.current = mode
   onPickRef.current = onPickStart
   onDrawRef.current = onDrawClick
   onDragRef.current = onDragHandle
+  onRouteClickRef.current = onRouteClick
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return
@@ -79,6 +84,18 @@ export function RunMap({
         onPickRef.current?.(point)
       } else if (modeRef.current === 'draw') {
         onDrawRef.current?.(point)
+      } else if (modeRef.current === 'view' && onRouteClickRef.current) {
+        const layers = [ROUTE_LAYER, ROUTE_HIT].filter((id) => map.getLayer(id))
+        if (!layers.length) return
+        const pad = 16
+        const hits = map.queryRenderedFeatures(
+          [
+            [e.point.x - pad, e.point.y - pad],
+            [e.point.x + pad, e.point.y + pad],
+          ],
+          { layers },
+        )
+        if (hits.length) onRouteClickRef.current(point)
       }
     })
 
@@ -120,7 +137,30 @@ export function RunMap({
           'line-opacity': 0.92,
         },
       })
+      map.addLayer({
+        id: ROUTE_HIT,
+        type: 'line',
+        source: ROUTE_SOURCE,
+        layout: {
+          'line-cap': 'round',
+          'line-join': 'round',
+        },
+        paint: {
+          'line-color': '#1f6f4a',
+          'line-width': 22,
+          'line-opacity': 0.01,
+        },
+      })
       map.resize()
+    })
+
+    map.on('mouseenter', ROUTE_HIT, () => {
+      if (modeRef.current === 'view' && onRouteClickRef.current) {
+        map.getCanvas().style.cursor = 'pointer'
+      }
+    })
+    map.on('mouseleave', ROUTE_HIT, () => {
+      map.getCanvas().style.cursor = ''
     })
 
     const resizeMap = () => map.resize()
@@ -267,6 +307,7 @@ export function RunMap({
       const el = document.createElement('div')
       el.className = 'route-handle'
       el.title = 'Drag to reshape the route'
+      el.addEventListener('click', (ev) => ev.stopPropagation())
       const marker = new Marker({ element: el, draggable: true })
         .setLngLat([point.lng, point.lat])
         .addTo(map)

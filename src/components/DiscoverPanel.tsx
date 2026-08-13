@@ -15,6 +15,7 @@ type FormState = {
   distanceMiles: string
   varianceMiles: string
   maxElevationFeet: string
+  allowLights: boolean
 }
 
 const defaults: FormState = {
@@ -23,6 +24,7 @@ const defaults: FormState = {
   distanceMiles: '5',
   varianceMiles: '0.5',
   maxElevationFeet: '200',
+  allowLights: false,
 }
 
 type Props = {
@@ -129,6 +131,7 @@ export function DiscoverPanel({
         distanceMiles,
         varianceMiles,
         maxClimbFeet: maxElevationFeet,
+        allowLights: form.allowLights,
         onStatus,
       })
       onHits(found)
@@ -238,6 +241,35 @@ export function DiscoverPanel({
             />
           </label>
         </div>
+
+        <fieldset className="field choice-field">
+          <legend>Lights</legend>
+          <div className="choice-row" role="radiogroup" aria-label="Lights">
+            <button
+              type="button"
+              className={`choice${form.allowLights ? '' : ' is-on'}`}
+              aria-pressed={!form.allowLights}
+              disabled={busy}
+              onClick={() => setForm({ ...form, allowLights: false })}
+            >
+              No
+            </button>
+            <button
+              type="button"
+              className={`choice${form.allowLights ? ' is-on' : ''}`}
+              aria-pressed={form.allowLights}
+              disabled={busy}
+              onClick={() => setForm({ ...form, allowLights: true })}
+            >
+              Yes
+            </button>
+          </div>
+          <em className="field-hint">
+            {form.allowLights
+              ? 'Traffic lights are allowed. Runs are still ranked by how many they hit.'
+              : 'Routes avoid traffic lights when possible.'}
+          </em>
+        </fieldset>
 
         <button
           className="btn primary"

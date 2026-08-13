@@ -39,6 +39,8 @@ export type RouteRequest = {
   varianceMiles: number
   /** Max cumulative climb (elevation gain only), in feet */
   maxClimbFeet: number
+  /** When true, pathfinding does not avoid traffic lights. Ranking still prefers fewer. */
+  allowLights?: boolean
   /** How many auto-route alternatives to return (default 3). */
   optionCount?: number
   onStatus?: (message: string) => void
@@ -130,6 +132,11 @@ type ManualDrawState = {
 let activeSession: RouteSession | null = null
 let manualDraw: ManualDrawState | null = null
 let plannedBundle: PlannedBundle | null = null
+let editHistory: Array<{
+  nodePath: number[]
+  controlIndexes: number[]
+  kind: RouteKind
+}> = []
 
 const MAX_ROUTE_OPTIONS = 9
 
@@ -143,6 +150,21 @@ export function isManualDrawing(): boolean {
 
 export function clearPlannedRoutes(): void {
   plannedBundle = null
+  editHistory = []
+}
+
+function pushEditSnapshot(): void {
+  if (!activeSession) return
+  editHistory.push({
+    nodePath: [...activeSession.nodePath],
+    controlIndexes: [...activeSession.controlIndexes],
+    kind: activeSession.kind,
+  })
+  if (editHistory.length > 30) editHistory.shift()
+}
+
+export function canUndoRouteEdit(): boolean {
+  return editHistory.length > 0
 }
 
 export type RoutingSnapshot = {
@@ -166,6 +188,7 @@ export function restoreRoutingState(snap: RoutingSnapshot): void {
   manualDraw = null
   activeSession = snap.session
   plannedBundle = snap.planned
+  editHistory = []
 }
 
 export function hasMorePlannedRoutes(): boolean {
@@ -182,6 +205,7 @@ export function selectPlannedRoute(index: number): RouteResult {
     throw new Error('That route option is no longer available.')
   }
   const opt = plannedBundle.options[index]
+  editHistory = []
   activeSession = {
     graph: plannedBundle.graph,
     nodePath: opt.candidate.path,
@@ -461,6 +485,33 @@ function buildControlIndexes(graph: RunGraph, path: number[], spacingM = 480): n
   return indexes
 }
 
+function normalizeControlIndexes(indexes: number[], pathLen: number): number[] {
+  const uniq = new Set<number>([0, pathLen - 1])
+  for (const i of indexes) {
+    if (i > 0 && i < pathLen - 1) uniq.add(i)
+  }
+  return [...uniq].sort((a, b) => a - b)
+}
+
+function closestPathIndex(graph: RunGraph, path: number[], point: LatLng): {
+  index: number
+  distM: number
+} {
+  let best = 1
+  let bestDist = Infinity
+  const last = Math.max(1, path.length - 2)
+  for (let i = 1; i <= last; i++) {
+    const pos = graph.nodePos.get(path[i])
+    if (!pos) continue
+    const d = haversineMeters(point, pos)
+    if (d < bestDist) {
+      bestDist = d
+      best = i
+    }
+  }
+  return { index: best, distM: bestDist }
+}
+
 function controlPointsFromIndexes(
   graph: RunGraph,
   nodePath: number[],
@@ -591,7 +642,7 @@ async function buildRouteResult(
   graph: RunGraph,
   candidate: RouteCandidate,
   minDistanceMiles: number,
-  options?: { waypoints?: LatLng[] },
+  options?: { waypoints?: LatLng[]; controlIndexes?: number[] },
 ): Promise<{ result: RouteResult; controlIndexes: number[] }> {
   let coordinates = pathToLatLng(graph, candidate.path)
   // Only force-close auto loops that didn't quite snap back
@@ -626,7 +677,9 @@ async function buildRouteResult(
     )
   }
 
-  const controlIndexes = buildControlIndexes(graph, candidate.path)
+  const controlIndexes = options?.controlIndexes?.length
+    ? normalizeControlIndexes(options.controlIndexes, candidate.path.length)
+    : buildControlIndexes(graph, candidate.path)
   const result: RouteResult = {
     coordinates: dense,
     elevationsM,
@@ -655,7 +708,7 @@ async function finalizeRoute(
   candidate: RouteCandidate,
   start: LatLng,
   minDistanceMiles: number,
-  options?: { waypoints?: LatLng[] },
+  options?: { waypoints?: LatLng[]; controlIndexes?: number[] },
 ): Promise<RouteResult> {
   plannedBundle = null
   const built = await buildRouteResult(
@@ -678,10 +731,12 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
   const status = req.onStatus ?? (() => {})
   manualDraw = null
   plannedBundle = null
+  editHistory = []
   const minM = milesToMeters(req.distanceMiles)
   const maxM = milesToMeters(req.distanceMiles + req.varianceMiles)
   const maxClimbM = req.maxClimbFeet / 3.28084
   const optionCount = Math.max(1, Math.min(9, req.optionCount ?? 3))
+  const allowLights = Boolean(req.allowLights)
 
   const radiusM = Math.min(5000, Math.max(1100, minM * 0.7))
 
@@ -701,7 +756,11 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
     throw new Error('Could not snap the start point to a walkable road.')
   }
 
-  status('Searching for quiet route options…')
+  status(
+    allowLights
+      ? 'Searching for route options…'
+      : 'Searching for quiet route options…',
+  )
 
   const outAndBackRadii = [minM * 0.45, minM * 0.5, minM * 0.55]
   const loopRadii = [minM * 0.42, minM * 0.5, maxM / (2 * Math.PI) * 1.2]
@@ -713,17 +772,20 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
     // Climb-first: willing to take a light to stay flatter
     {
       elevGainPenalty: 200,
-      signalPenalty: 60,
+      signalPenalty: allowLights ? 0 : 60,
       turnPenalty: 25,
       crossingPenalty: 4,
     },
     // Balanced quiet + climb
-    DEFAULT_WEIGHTS,
-    // Quiet-first alternate for a different option shape
+    {
+      ...DEFAULT_WEIGHTS,
+      signalPenalty: allowLights ? 0 : DEFAULT_WEIGHTS.signalPenalty,
+    },
+    // Quiet-first (or turns-first when lights are allowed)
     {
       elevGainPenalty: 70,
-      signalPenalty: 900,
-      turnPenalty: 45,
+      signalPenalty: allowLights ? 0 : 900,
+      turnPenalty: allowLights ? 55 : 45,
       crossingPenalty: 10,
     },
   ]
@@ -851,7 +913,7 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
     status('Stretching the route to meet distance…')
     const softWeights: PathCostWeights = {
       turnPenalty: 25,
-      signalPenalty: 80,
+      signalPenalty: allowLights ? 0 : 80,
       crossingPenalty: 5,
       elevGainPenalty: 160,
     }
@@ -1055,12 +1117,21 @@ export async function dragRouteHandle(
     throw new Error('Could not re-route through that point.')
   }
 
+  pushEditSnapshot()
+
   const newSlice = mergePaths([leg1.path, leg2.path])
   const nodePath = [
     ...session.nodePath.slice(0, prevPathIdx),
     ...newSlice,
     ...session.nodePath.slice(nextPathIdx + 1),
   ]
+  const snapAt = Math.max(0, newSlice.indexOf(snapped))
+  const delta = newSlice.length - (nextPathIdx - prevPathIdx + 1)
+  const controlIndexes = session.controlIndexes.map((idx, i) => {
+    if (i === controlIdx) return prevPathIdx + snapAt
+    if (idx >= nextPathIdx) return idx + delta
+    return idx
+  })
 
   // Recompute simple stats from path edges
   const elev = elevAlongPath(session.graph, nodePath)
@@ -1092,7 +1163,49 @@ export async function dragRouteHandle(
     turns,
   }
 
-  return finalizeRoute(session.graph, candidate, session.start, 0)
+  return finalizeRoute(session.graph, candidate, session.start, 0, {
+    controlIndexes,
+  })
+}
+
+/** Click the route line to insert a draggable waypoint. */
+export async function addRouteWaypoint(at: LatLng): Promise<RouteResult | null> {
+  const session = activeSession
+  if (!session) throw new Error('No active route to edit. Route a run first.')
+
+  const { index, distM } = closestPathIndex(session.graph, session.nodePath, at)
+  if (distM > 250) {
+    throw new Error('Click on the route to add a waypoint.')
+  }
+
+  const already = session.controlIndexes.some((i) => Math.abs(i - index) <= 1)
+  if (already) return null
+
+  pushEditSnapshot()
+  const controlIndexes = normalizeControlIndexes(
+    [...session.controlIndexes, index],
+    session.nodePath.length,
+  )
+  const candidate = candidateFromNodePath(
+    session.graph,
+    session.nodePath,
+    'edited',
+  )
+  return finalizeRoute(session.graph, candidate, session.start, 0, {
+    controlIndexes,
+  })
+}
+
+export async function undoRouteEdit(): Promise<RouteResult> {
+  const session = activeSession
+  const snap = editHistory.pop()
+  if (!session || !snap) {
+    throw new Error('Nothing to undo.')
+  }
+  const candidate = candidateFromNodePath(session.graph, snap.nodePath, snap.kind)
+  return finalizeRoute(session.graph, candidate, session.start, 0, {
+    controlIndexes: snap.controlIndexes,
+  })
 }
 
 function candidateFromNodePath(
@@ -1151,6 +1264,7 @@ export async function beginManualRoute(
   const status = onStatus ?? (() => {})
   plannedBundle = null
   activeSession = null
+  editHistory = []
   const radiusM = Math.min(
     6000,
     Math.max(1500, milesToMeters(distanceHintMiles) * 0.75),

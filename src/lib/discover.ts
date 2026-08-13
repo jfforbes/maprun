@@ -14,6 +14,7 @@ export type DiscoverRequest = {
   distanceMiles: number
   varianceMiles: number
   maxClimbFeet: number
+  allowLights?: boolean
   onStatus?: (message: string) => void
 }
 
@@ -296,6 +297,7 @@ export async function discoverRuns(
         distanceMiles: req.distanceMiles,
         varianceMiles: req.varianceMiles,
         maxClimbFeet: req.maxClimbFeet,
+        allowLights: req.allowLights,
         optionCount: 1,
         onStatus: (m) => status(`${hub.label}: ${m}`),
       })

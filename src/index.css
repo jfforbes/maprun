@@ -218,6 +218,56 @@ input {
   line-height: 1.35;
 }
 
+.choice-field {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.choice-field legend {
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 0;
+  margin: 0 0 0.35rem;
+}
+
+.choice-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.35rem;
+  padding: 0.28rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 8%, white);
+  border: 1px solid var(--line);
+}
+
+.choice {
+  border: 0;
+  border-radius: 999px;
+  padding: 0.55rem 0.7rem;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.86rem;
+  font-weight: 700;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.choice.is-on {
+  background: var(--accent);
+  color: #f4faf6;
+}
+
+.choice:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .autocomplete {
   position: relative;
   width: 100%;
@@ -439,6 +489,14 @@ input {
   margin: 0 0 0.65rem;
   font-family: 'Fraunces', serif;
   font-size: 1.35rem;
+}
+
+.stats .field-hint {
+  margin: 0 0 0.75rem;
+}
+
+.stats .btn-row {
+  margin-top: 0.85rem;
 }
 
 .stats ul {

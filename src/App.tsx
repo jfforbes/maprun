@@ -8,8 +8,10 @@ import type { DiscoverHit } from './lib/discover'
 import type { LatLng } from './lib/geo'
 import {
   addManualWaypoint,
+  addRouteWaypoint,
   beginManualRoute,
   cancelManualRoute,
+  canUndoRouteEdit,
   clearPlannedRoutes,
   dragRouteHandle,
   finishManualAtStart,
@@ -18,6 +20,7 @@ import {
   planRunRoute,
   selectPlannedRoute,
   undoManualWaypoint,
+  undoRouteEdit,
   type RouteResult,
 } from './lib/router'
 
@@ -28,6 +31,7 @@ type FormState = {
   distanceMiles: string
   varianceMiles: string
   maxElevationFeet: string
+  allowLights: boolean
 }
 
 const defaults: FormState = {
@@ -35,6 +39,7 @@ const defaults: FormState = {
   distanceMiles: '5',
   varianceMiles: '0.5',
   maxElevationFeet: '200',
+  allowLights: false,
 }
 
 export default function App() {
@@ -57,6 +62,7 @@ export default function App() {
     null,
   )
   const [discoverHome, setDiscoverHome] = useState<LatLng | null>(null)
+  const [canUndoEdit, setCanUndoEdit] = useState(false)
 
   const selectedDiscover = useMemo(
     () => discoverHits.find((h) => h.id === discoverSelectedId) ?? null,
@@ -115,6 +121,7 @@ export default function App() {
     setRouteOptions([])
     setSelectedOption(0)
     setMoreAvailable(false)
+    setCanUndoEdit(false)
     clearPlannedRoutes()
   }
 
@@ -187,6 +194,7 @@ export default function App() {
       setRouteOptions([])
       setSelectedOption(0)
       setMoreAvailable(false)
+      setCanUndoEdit(false)
       setDrawing(true)
       setStatus('Click the map to add waypoints. Streets will connect them.')
     } catch (err) {
@@ -271,10 +279,55 @@ export default function App() {
       setRoute(result)
       setRouteOptions([])
       setSelectedOption(0)
+      setMoreAvailable(false)
+      setCanUndoEdit(canUndoRouteEdit())
       setStatus(null)
     } catch (err) {
       setStatus(null)
       setError(err instanceof Error ? err.message : 'Could not update route.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function onRouteClick(point: LatLng) {
+    if (tab !== 'nearby' || drawing || busy || !route) return
+    setError(null)
+    setBusy(true)
+    setStatus('Adding waypoint…')
+    try {
+      const result = await addRouteWaypoint(point)
+      if (!result) {
+        setStatus(null)
+        return
+      }
+      setRoute(result)
+      setRouteOptions([])
+      setSelectedOption(0)
+      setMoreAvailable(false)
+      setCanUndoEdit(canUndoRouteEdit())
+      setStatus(null)
+    } catch (err) {
+      setStatus(null)
+      setError(err instanceof Error ? err.message : 'Could not add waypoint.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function onUndoEdit() {
+    if (busy || !canUndoEdit) return
+    setError(null)
+    setBusy(true)
+    setStatus('Undoing…')
+    try {
+      const result = await undoRouteEdit()
+      setRoute(result)
+      setCanUndoEdit(canUndoRouteEdit())
+      setStatus(null)
+    } catch (err) {
+      setStatus(null)
+      setError(err instanceof Error ? err.message : 'Could not undo.')
     } finally {
       setBusy(false)
     }
@@ -286,6 +339,7 @@ export default function App() {
       const result = selectPlannedRoute(index)
       setSelectedOption(index)
       setRoute(result)
+      setCanUndoEdit(false)
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not switch routes.')
@@ -330,6 +384,7 @@ export default function App() {
         distanceMiles,
         varianceMiles,
         maxClimbFeet: maxElevationFeet,
+        allowLights: form.allowLights,
         onStatus: setStatus,
       })
 
@@ -337,6 +392,7 @@ export default function App() {
       setSelectedOption(planned.selectedIndex)
       setRoute(planned.routes[planned.selectedIndex] ?? null)
       setMoreAvailable(hasMorePlannedRoutes())
+      setCanUndoEdit(false)
       setStatus(null)
     } catch (err) {
       setStatus(null)
@@ -507,6 +563,35 @@ export default function App() {
             </em>
           </label>
 
+          <fieldset className="field choice-field">
+            <legend>Lights</legend>
+            <div className="choice-row" role="radiogroup" aria-label="Lights">
+              <button
+                type="button"
+                className={`choice${form.allowLights ? '' : ' is-on'}`}
+                aria-pressed={!form.allowLights}
+                disabled={drawing || busy}
+                onClick={() => setForm({ ...form, allowLights: false })}
+              >
+                No
+              </button>
+              <button
+                type="button"
+                className={`choice${form.allowLights ? ' is-on' : ''}`}
+                aria-pressed={form.allowLights}
+                disabled={drawing || busy}
+                onClick={() => setForm({ ...form, allowLights: true })}
+              >
+                Yes
+              </button>
+            </div>
+            <em className="field-hint">
+              {form.allowLights
+                ? 'Traffic lights are allowed. Options are still ranked by how many they hit.'
+                : 'Routes avoid traffic lights when possible.'}
+            </em>
+          </fieldset>
+
           {!drawing ? (
             <div className="btn-row">
               <button className="btn primary" type="submit" disabled={busy || !canStart}>
@@ -605,6 +690,9 @@ export default function App() {
         {summary && (
           <section className="stats" aria-live="polite">
             <h2>Route</h2>
+            <p className="field-hint">
+              Click the route to add a waypoint, or drag the green handles.
+            </p>
             <ul>
               {summary.map((item) => (
                 <li key={item.label}>
@@ -613,14 +701,24 @@ export default function App() {
                 </li>
               ))}
             </ul>
-            <button
-              className="btn secondary"
-              type="button"
-              onClick={onExport}
-              disabled={!canExport}
-            >
-              Export GPX
-            </button>
+            <div className="btn-row">
+              <button
+                className="btn ghost"
+                type="button"
+                disabled={busy || !canUndoEdit}
+                onClick={onUndoEdit}
+              >
+                Undo
+              </button>
+              <button
+                className="btn secondary"
+                type="button"
+                onClick={onExport}
+                disabled={!canExport}
+              >
+                Export GPX
+              </button>
+            </div>
           </section>
         )}
 
@@ -643,24 +741,39 @@ export default function App() {
             >
               Controls
             </button>
-            {drawing && tab === 'nearby' && (
+            {tab === 'nearby' && (
               <div className="map-chrome-actions">
-                <button
-                  className="btn ghost map-chrome-btn"
-                  type="button"
-                  disabled={busy || !route}
-                  onClick={onUndoWaypoint}
-                >
-                  Undo
-                </button>
-                <button
-                  className="btn ghost map-chrome-btn"
-                  type="button"
-                  disabled={busy || !route}
-                  onClick={onFinishAtStart}
-                >
-                  Finish
-                </button>
+                {drawing ? (
+                  <>
+                    <button
+                      className="btn ghost map-chrome-btn"
+                      type="button"
+                      disabled={busy || !route}
+                      onClick={onUndoWaypoint}
+                    >
+                      Undo
+                    </button>
+                    <button
+                      className="btn ghost map-chrome-btn"
+                      type="button"
+                      disabled={busy || !route}
+                      onClick={onFinishAtStart}
+                    >
+                      Finish
+                    </button>
+                  </>
+                ) : (
+                  route && (
+                    <button
+                      className="btn ghost map-chrome-btn"
+                      type="button"
+                      disabled={busy || !canUndoEdit}
+                      onClick={onUndoEdit}
+                    >
+                      Undo
+                    </button>
+                  )
+                )}
               </div>
             )}
           </div>
@@ -694,6 +807,9 @@ export default function App() {
           onPickStart={onPickStart}
           onDrawClick={tab === 'nearby' ? onDrawClick : undefined}
           onDragHandle={tab === 'nearby' ? onDragHandle : undefined}
+          onRouteClick={
+            tab === 'nearby' && !drawing ? onRouteClick : undefined
+          }
         />
       </main>
     </div>
