@@ -145,6 +145,29 @@ export function clearPlannedRoutes(): void {
   plannedBundle = null
 }
 
+export type RoutingSnapshot = {
+  session: RouteSession
+  planned: PlannedBundle | null
+}
+
+export function snapshotRoutingState(): RoutingSnapshot | null {
+  if (!activeSession) return null
+  return {
+    session: {
+      ...activeSession,
+      nodePath: [...activeSession.nodePath],
+      controlIndexes: [...activeSession.controlIndexes],
+    },
+    planned: plannedBundle,
+  }
+}
+
+export function restoreRoutingState(snap: RoutingSnapshot): void {
+  manualDraw = null
+  activeSession = snap.session
+  plannedBundle = snap.planned
+}
+
 export function hasMorePlannedRoutes(): boolean {
   return Boolean(
     plannedBundle &&
