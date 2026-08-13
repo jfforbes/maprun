@@ -39,6 +39,8 @@ export type RouteRequest = {
   varianceMiles: number
   /** Max cumulative climb (elevation gain only), in feet */
   maxClimbFeet: number
+  /** How many auto-route alternatives to return (default 3). */
+  optionCount?: number
   onStatus?: (message: string) => void
 }
 
@@ -127,6 +129,11 @@ let activeSession: RouteSession | null = null
 let manualDraw: ManualDrawState | null = null
 let plannedBundle: PlannedBundle | null = null
 
+export type RoutingSnapshot = {
+  session: RouteSession
+  planned: PlannedBundle | null
+}
+
 export function getActiveSession(): RouteSession | null {
   return activeSession
 }
@@ -137,6 +144,24 @@ export function isManualDrawing(): boolean {
 
 export function clearPlannedRoutes(): void {
   plannedBundle = null
+}
+
+export function snapshotRoutingState(): RoutingSnapshot | null {
+  if (!activeSession) return null
+  return {
+    session: {
+      ...activeSession,
+      nodePath: [...activeSession.nodePath],
+      controlIndexes: [...activeSession.controlIndexes],
+    },
+    planned: plannedBundle,
+  }
+}
+
+export function restoreRoutingState(snap: RoutingSnapshot): void {
+  manualDraw = null
+  activeSession = snap.session
+  plannedBundle = snap.planned
 }
 
 /** Switch the active auto-route option (updates edit session). */
@@ -646,7 +671,7 @@ export async function planRunRoute(req: RouteRequest): Promise<PlanRunResult> {
   const minM = milesToMeters(req.distanceMiles)
   const maxM = milesToMeters(req.distanceMiles + req.varianceMiles)
   const maxClimbM = req.maxClimbFeet / 3.28084
-  const optionCount = 3
+  const optionCount = Math.max(1, Math.min(5, req.optionCount ?? 3))
 
   const radiusM = Math.min(5000, Math.max(1100, minM * 0.7))
 

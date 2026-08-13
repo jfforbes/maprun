@@ -107,6 +107,44 @@ input {
   line-height: 1.4;
 }
 
+.discover-lead {
+  margin: 0 0 0.25rem;
+}
+
+.tab-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.4rem;
+  margin-top: 0.85rem;
+  padding: 0.3rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 8%, white);
+  border: 1px solid var(--line);
+}
+
+.tab {
+  border: 0;
+  border-radius: 999px;
+  padding: 0.55rem 0.7rem;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.86rem;
+  font-weight: 700;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.tab.is-active {
+  background: var(--accent);
+  color: #f4faf6;
+}
+
+.tab:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .route-form {
   display: flex;
   flex-direction: column;
@@ -454,6 +492,27 @@ input {
   background: #183225;
   border: 3px solid #f4faf6;
   box-shadow: 0 6px 16px rgba(20, 32, 24, 0.35);
+}
+
+.parking-marker {
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  background: #2c4a6e;
+  border: 3px solid #f4faf6;
+  box-shadow: 0 4px 12px rgba(20, 32, 24, 0.35);
+  position: relative;
+}
+
+.parking-marker::after {
+  content: 'P';
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #f4faf6;
+  font-size: 0.7rem;
+  font-weight: 800;
 }
 
 .route-handle {
